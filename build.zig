@@ -28,6 +28,10 @@ pub fn build(b: *std.Build) void {
     const hnsw_test_step = b.step("test", "Run tests");
     hnsw_test_step.dependOn(&run_hnsw_tests.step);
 
+    // Compile-fail tests (src/array_of_*.zig, src/zero_length_array.zig, etc.)
+    // Run manually: cd src && zig build-obj <name>.zig
+    // These verify that invalid metadata types produce expected compile errors.
+
     // Add unit tests
     // const unit_tests = b.addTest(.{
     //     .root_source_file = b.path("tests/unit/main.zig"),

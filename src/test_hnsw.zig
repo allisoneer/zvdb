@@ -238,6 +238,434 @@ test "metadata encode and decode" {
 }
 
 // =============================================================================
+// Extended Metadata FixedOf Tests (Phase 2)
+// =============================================================================
+
+test "metadata FixedOf - optionals add presence_words" {
+    const Meta = struct { a: ?u32, b: []const u8 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    // presence_words: [1]u64 (8) + a: u32 (4) + b_off: u32 (4) + b_len: u32 (4) = 20
+    try testing.expect(@hasField(Fixed, "presence_words"));
+    try testing.expect(@hasField(Fixed, "a"));
+    try testing.expect(@hasField(Fixed, "b_off"));
+    try testing.expect(@hasField(Fixed, "b_len"));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(Fixed)); // 8 + 4 + 4 + 4 + 4 (padding to 8)
+}
+
+test "metadata FixedOf - no optionals no presence_words" {
+    const Meta = struct { x: u32, y: f32 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    // x: u32 (4) + y: f32 (4) = 8
+    try testing.expect(!@hasField(Fixed, "presence_words"));
+    try testing.expect(@hasField(Fixed, "x"));
+    try testing.expect(@hasField(Fixed, "y"));
+    try testing.expectEqual(@as(usize, 8), @sizeOf(Fixed));
+}
+
+test "metadata FixedOf - primitive array inline" {
+    const Meta = struct { arr: [4]f32, tag: u8 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    // arr: [4]f32 (16) + tag: u8 (1) + padding = 20 (extern alignment)
+    try testing.expect(@hasField(Fixed, "arr"));
+    try testing.expect(@hasField(Fixed, "tag"));
+}
+
+test "metadata FixedOf - nested struct flattening" {
+    const Inner = struct { x: u32, y: u32 };
+    const Meta = struct { loc: Inner, name: []const u8 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    try testing.expect(@hasField(Fixed, "loc__x"));
+    try testing.expect(@hasField(Fixed, "loc__y"));
+    try testing.expect(@hasField(Fixed, "name_off"));
+    try testing.expect(@hasField(Fixed, "name_len"));
+}
+
+test "metadata FixedOf - two level nesting" {
+    const Deep = struct { val: i16 };
+    const Mid = struct { d: Deep, flag: bool };
+    const Meta = struct { m: Mid };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    try testing.expect(@hasField(Fixed, "m__d__val"));
+    try testing.expect(@hasField(Fixed, "m__flag"));
+}
+
+test "metadata FixedOf - optional nested struct" {
+    const Inner = struct { a: u32, b: u32 };
+    const Meta = struct { data: ?Inner };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    // Should have presence_words since there's an optional
+    try testing.expect(@hasField(Fixed, "presence_words"));
+    try testing.expect(@hasField(Fixed, "data__a"));
+    try testing.expect(@hasField(Fixed, "data__b"));
+}
+
+test "metadata FixedOf - optional array" {
+    const Meta = struct { arr: ?[3]i16 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    try testing.expect(@hasField(Fixed, "presence_words"));
+    try testing.expect(@hasField(Fixed, "arr"));
+}
+
+test "metadata FixedOf - enum with explicit tag" {
+    const Status = enum(u8) { Active, Inactive, Pending };
+    const Meta = struct { status: Status, value: u32 };
+    const Fixed = zvdb.metadata.FixedOf(Meta);
+    try testing.expect(@hasField(Fixed, "status"));
+    try testing.expect(@hasField(Fixed, "value"));
+}
+
+// =============================================================================
+// Extended Metadata Encode/Decode Tests (Phase 3)
+// =============================================================================
+
+test "metadata encode/decode - optional present and null" {
+    const Meta = struct { a: ?u32, b: u32 };
+    var st = zvdb.metadata.StringTable{};
+
+    // Present
+    const m1: Meta = .{ .a = 42, .b = 10 };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expect(r1.a != null);
+    try testing.expectEqual(@as(u32, 42), r1.a.?);
+
+    // Null
+    const m2: Meta = .{ .a = null, .b = 20 };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.a == null);
+    try testing.expectEqual(@as(u32, 20), r2.b);
+}
+
+test "metadata encode/decode - optional string" {
+    const Meta = struct { name: ?[]const u8, id: u32 };
+    var st = zvdb.metadata.StringTable{};
+    defer if (st.data.len > 0) testing.allocator.free(st.data);
+
+    const m1: Meta = .{ .name = "hello", .id = 1 };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expect(r1.name != null);
+    try testing.expectEqualStrings("hello", r1.name.?);
+
+    const m2: Meta = .{ .name = null, .id = 2 };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.name == null);
+}
+
+test "metadata encode/decode - optional array" {
+    const Meta = struct { arr: ?[3]i16 };
+    var st = zvdb.metadata.StringTable{};
+
+    const m1: Meta = .{ .arr = .{ 1, 2, 3 } };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expect(r1.arr != null);
+    try testing.expectEqual(@as(i16, 2), r1.arr.?[1]);
+
+    const m2: Meta = .{ .arr = null };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.arr == null);
+}
+
+test "metadata encode/decode - nested struct" {
+    const Inner = struct { x: u32, y: u32 };
+    const Meta = struct { loc: Inner, tag: u8 };
+    var st = zvdb.metadata.StringTable{};
+
+    const m: Meta = .{ .loc = .{ .x = 10, .y = 20 }, .tag = 5 };
+    const f = try zvdb.metadata.encode(Meta, m, &st, testing.allocator);
+    const r = zvdb.metadata.decode(Meta, f, &st);
+    try testing.expectEqual(@as(u32, 10), r.loc.x);
+    try testing.expectEqual(@as(u32, 20), r.loc.y);
+    try testing.expectEqual(@as(u8, 5), r.tag);
+}
+
+test "metadata encode/decode - optional nested struct" {
+    const Inner = struct { name: []const u8, val: u16 };
+    const Meta = struct { data: ?Inner, score: f32 };
+    var st = zvdb.metadata.StringTable{};
+    defer if (st.data.len > 0) testing.allocator.free(st.data);
+
+    // Present
+    const m1: Meta = .{ .data = .{ .name = "test", .val = 100 }, .score = 1.5 };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expect(r1.data != null);
+    try testing.expectEqualStrings("test", r1.data.?.name);
+
+    // Null
+    const m2: Meta = .{ .data = null, .score = 2.5 };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.data == null);
+}
+
+test "metadata encode/decode - primitive array" {
+    const Meta = struct { arr: [4]f32, tag: u8 };
+    var st = zvdb.metadata.StringTable{};
+
+    const m: Meta = .{ .arr = .{ 1.0, 2.0, 3.0, 4.0 }, .tag = 42 };
+    const f = try zvdb.metadata.encode(Meta, m, &st, testing.allocator);
+    const r = zvdb.metadata.decode(Meta, f, &st);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), r.arr[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), r.arr[3], 0.001);
+    try testing.expectEqual(@as(u8, 42), r.tag);
+}
+
+test "metadata encode/decode - multiple optionals" {
+    const Meta = struct { a: ?u32, b: ?u32, c: u32 };
+    var st = zvdb.metadata.StringTable{};
+
+    // Both present
+    const m1: Meta = .{ .a = 1, .b = 2, .c = 3 };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expectEqual(@as(u32, 1), r1.a.?);
+    try testing.expectEqual(@as(u32, 2), r1.b.?);
+
+    // First null, second present
+    const m2: Meta = .{ .a = null, .b = 99, .c = 3 };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.a == null);
+    try testing.expectEqual(@as(u32, 99), r2.b.?);
+
+    // Both null
+    const m3: Meta = .{ .a = null, .b = null, .c = 3 };
+    const f3 = try zvdb.metadata.encode(Meta, m3, &st, testing.allocator);
+    const r3 = zvdb.metadata.decode(Meta, f3, &st);
+    try testing.expect(r3.a == null);
+    try testing.expect(r3.b == null);
+}
+
+test "metadata totalStringBytesForBatch skips null optionals" {
+    const Meta = struct { a: ?[]const u8, b: []const u8 };
+    const metas = [_]Meta{
+        .{ .a = "xx", .b = "bbb" }, // 2 + 3 = 5
+        .{ .a = null, .b = "c" }, // 0 + 1 = 1
+    };
+    const total = zvdb.metadata.totalStringBytesForBatch(Meta, &metas);
+    try testing.expectEqual(@as(usize, 6), total);
+}
+
+test "metadata encode/decode - nested optional with inner optional" {
+    const Inner = struct { val: ?u32 };
+    const Meta = struct { data: ?Inner };
+    var st = zvdb.metadata.StringTable{};
+
+    // Outer present, inner present
+    const m1: Meta = .{ .data = .{ .val = 42 } };
+    const f1 = try zvdb.metadata.encode(Meta, m1, &st, testing.allocator);
+    const r1 = zvdb.metadata.decode(Meta, f1, &st);
+    try testing.expect(r1.data != null);
+    try testing.expect(r1.data.?.val != null);
+    try testing.expectEqual(@as(u32, 42), r1.data.?.val.?);
+
+    // Outer present, inner null
+    const m2: Meta = .{ .data = .{ .val = null } };
+    const f2 = try zvdb.metadata.encode(Meta, m2, &st, testing.allocator);
+    const r2 = zvdb.metadata.decode(Meta, f2, &st);
+    try testing.expect(r2.data != null);
+    try testing.expect(r2.data.?.val == null);
+
+    // Outer null
+    const m3: Meta = .{ .data = null };
+    const f3 = try zvdb.metadata.encode(Meta, m3, &st, testing.allocator);
+    const r3 = zvdb.metadata.decode(Meta, f3, &st);
+    try testing.expect(r3.data == null);
+}
+
+// =============================================================================
+// HNSW Integration Test with Extended Metadata (Phase 4)
+// =============================================================================
+
+test "HNSW with extended metadata - optionals, arrays, nested structs" {
+    const allocator = testing.allocator;
+
+    // Complex metadata with all supported extended types
+    const Location = struct { line: u32, col: u32 };
+    const ExtendedMeta = struct {
+        name: []const u8, // string
+        score: f32, // primitive
+        tags: [3]u8, // primitive array
+        location: Location, // nested struct
+        description: ?[]const u8, // optional string
+        priority: ?u8, // optional primitive
+    };
+
+    var hnsw = HNSW(f32, .squared_euclidean, ExtendedMeta).init(allocator, 4, 16, 200);
+    defer hnsw.deinit();
+
+    // Insert with full metadata (all optionals present)
+    _ = try hnsw.insert(&[_]f32{ 1.0, 0.0, 0.0, 0.0 }, .{
+        .name = "first",
+        .score = 0.9,
+        .tags = .{ 1, 2, 3 },
+        .location = .{ .line = 10, .col = 5 },
+        .description = "First item description",
+        .priority = 1,
+    });
+
+    // Insert with some nulls
+    _ = try hnsw.insert(&[_]f32{ 0.0, 1.0, 0.0, 0.0 }, .{
+        .name = "second",
+        .score = 0.8,
+        .tags = .{ 4, 5, 6 },
+        .location = .{ .line = 20, .col = 10 },
+        .description = null,
+        .priority = 2,
+    });
+
+    // Insert with all optionals null
+    _ = try hnsw.insert(&[_]f32{ 0.0, 0.0, 1.0, 0.0 }, .{
+        .name = "third",
+        .score = 0.7,
+        .tags = .{ 7, 8, 9 },
+        .location = .{ .line = 30, .col = 15 },
+        .description = null,
+        .priority = null,
+    });
+
+    // Search and verify metadata retrieval
+    const results = try hnsw.searchTopK(&[_]f32{ 1.0, 0.0, 0.0, 0.0 }, 3, 50);
+    defer allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expectEqual(@as(usize, 0), results[0].id); // First should be closest
+
+    // Retrieve and verify metadata for first result
+    const meta0 = hnsw.getMetadata(0).?;
+    try testing.expectEqualStrings("first", meta0.name);
+    try testing.expectApproxEqAbs(@as(f32, 0.9), meta0.score, 0.001);
+    try testing.expectEqual(@as(u8, 1), meta0.tags[0]);
+    try testing.expectEqual(@as(u32, 10), meta0.location.line);
+    try testing.expect(meta0.description != null);
+    try testing.expectEqualStrings("First item description", meta0.description.?);
+    try testing.expectEqual(@as(u8, 1), meta0.priority.?);
+
+    // Verify second result (some nulls)
+    const meta1 = hnsw.getMetadata(1).?;
+    try testing.expectEqualStrings("second", meta1.name);
+    try testing.expect(meta1.description == null);
+    try testing.expectEqual(@as(u8, 2), meta1.priority.?);
+
+    // Verify third result (all optionals null)
+    const meta2 = hnsw.getMetadata(2).?;
+    try testing.expectEqualStrings("third", meta2.name);
+    try testing.expect(meta2.description == null);
+    try testing.expect(meta2.priority == null);
+}
+
+test "HNSW batch insert with extended metadata" {
+    const allocator = testing.allocator;
+
+    const Meta = struct {
+        label: []const u8,
+        value: ?i32,
+    };
+
+    var hnsw = HNSW(f32, .squared_euclidean, Meta).init(allocator, 2, 16, 200);
+    defer hnsw.deinit();
+
+    const points = [_][]const f32{
+        &[_]f32{ 1.0, 0.0 },
+        &[_]f32{ 0.0, 1.0 },
+        &[_]f32{ 1.0, 1.0 },
+    };
+    const metas = [_]Meta{
+        .{ .label = "a", .value = 100 },
+        .{ .label = "b", .value = null },
+        .{ .label = "c", .value = 300 },
+    };
+
+    const ids = try hnsw.insertBatch(&points, &metas);
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 3), ids.len);
+
+    // Verify metadata
+    const m0 = hnsw.getMetadata(ids[0]).?;
+    try testing.expectEqualStrings("a", m0.label);
+    try testing.expectEqual(@as(i32, 100), m0.value.?);
+
+    const m1 = hnsw.getMetadata(ids[1]).?;
+    try testing.expectEqualStrings("b", m1.label);
+    try testing.expect(m1.value == null);
+}
+
+test "HNSW save/load with extended metadata" {
+    const allocator = testing.allocator;
+    const std_fs = @import("std").fs;
+
+    const Meta = struct {
+        file: []const u8,
+        loc: struct { start: u32, end: u32 },
+        opt_rank: ?u16,
+        tags: [3]u8,
+    };
+
+    const path = "extended_meta_test.zvdb";
+    defer std_fs.cwd().deleteFile(path) catch {};
+
+    // Create and populate index
+    {
+        var g = HNSW(f32, .squared_euclidean, Meta).init(allocator, 3, 8, 50);
+        defer g.deinit();
+
+        _ = try g.insert(&[_]f32{ 1, 2, 3 }, .{
+            .file = "main.zig",
+            .loc = .{ .start = 1, .end = 10 },
+            .opt_rank = 7,
+            .tags = .{ 1, 2, 3 },
+        });
+        _ = try g.insert(&[_]f32{ 1, 2, 4 }, .{
+            .file = "lib.zig",
+            .loc = .{ .start = 20, .end = 30 },
+            .opt_rank = null,
+            .tags = .{ 4, 5, 6 },
+        });
+
+        // Verify before save
+        const m0 = g.getMetadata(0).?;
+        try testing.expectEqualStrings("main.zig", m0.file);
+        try testing.expect(m0.opt_rank != null);
+        try testing.expectEqual(@as(u16, 7), m0.opt_rank.?);
+
+        try g.save(path);
+    }
+
+    // Load and verify
+    var loaded = try HNSW(f32, .squared_euclidean, Meta).load(allocator, path);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 2), loaded.count());
+
+    // Verify first record (with optional present)
+    const lm0 = loaded.getMetadata(0).?;
+    try testing.expectEqualStrings("main.zig", lm0.file);
+    try testing.expectEqual(@as(u32, 1), lm0.loc.start);
+    try testing.expectEqual(@as(u32, 10), lm0.loc.end);
+    try testing.expect(lm0.opt_rank != null);
+    try testing.expectEqual(@as(u16, 7), lm0.opt_rank.?);
+    try testing.expectEqual(@as(u8, 1), lm0.tags[0]);
+
+    // Verify second record (with optional null)
+    const lm1 = loaded.getMetadata(1).?;
+    try testing.expectEqualStrings("lib.zig", lm1.file);
+    try testing.expectEqual(@as(u32, 20), lm1.loc.start);
+    try testing.expect(lm1.opt_rank == null);
+    try testing.expectEqual(@as(u8, 5), lm1.tags[1]);
+
+    // Verify search still works after load
+    const results = try loaded.searchTopK(&[_]f32{ 1, 2, 3 }, 2, 50);
+    defer allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+// =============================================================================
 // HNSW Core Tests
 // =============================================================================
 
