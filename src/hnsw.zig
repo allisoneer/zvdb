@@ -2,40 +2,48 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
-const Order = std.math.Order;
 const Mutex = std.Thread.Mutex;
 
-pub fn HNSW(comptime T: type) type {
+pub const distance = @import("distance.zig");
+pub const metadata = @import("metadata.zig");
+pub const search = @import("search.zig");
+pub const persistence = @import("persistence.zig");
+
+pub const DistanceMetric = distance.DistanceMetric;
+
+pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata: type) type {
     return struct {
         const Self = @This();
+        pub const MetaFixed = metadata.FixedOf(Metadata);
+        const dist = distance.distanceFn(T, metric);
 
-        const Node = struct {
+        pub const Node = struct {
             id: usize,
             point: []T,
+            meta_fixed: MetaFixed,
             connections: []ArrayList(usize),
             mutex: Mutex,
 
-            fn init(allocator: Allocator, id: usize, point: []const T, level: usize) !Node {
-                const connections = try allocator.alloc(ArrayList(usize), level + 1);
-                errdefer allocator.free(connections);
-                for (connections) |*conn| {
-                    conn.* = .{};
-                }
+            pub fn init(allocator: Allocator, id: usize, point: []const T, level: usize, mf: MetaFixed) !Node {
+                const conns = try allocator.alloc(ArrayList(usize), level + 1);
+                errdefer allocator.free(conns);
+                for (conns) |*c| c.* = .{};
+
                 const owned_point = try allocator.alloc(T, point.len);
                 errdefer allocator.free(owned_point);
                 @memcpy(owned_point, point);
-                return Node{
+
+                return .{
                     .id = id,
                     .point = owned_point,
-                    .connections = connections,
-                    .mutex = Mutex{},
+                    .meta_fixed = mf,
+                    .connections = conns,
+                    .mutex = .{},
                 };
             }
 
-            fn deinit(self: *Node, allocator: Allocator) void {
-                for (self.connections) |*conn| {
-                    conn.deinit(allocator);
-                }
+            pub fn deinit(self: *Node, allocator: Allocator) void {
+                for (self.connections) |*c| c.deinit(allocator);
                 allocator.free(self.connections);
                 allocator.free(self.point);
             }
@@ -47,9 +55,12 @@ pub fn HNSW(comptime T: type) type {
         max_level: usize,
         m: usize,
         ef_construction: usize,
+        default_ef_search: usize,
+        dims: usize,
+        string_table: metadata.StringTable,
         mutex: Mutex,
 
-        pub fn init(allocator: Allocator, m: usize, ef_construction: usize) Self {
+        pub fn init(allocator: Allocator, dims: usize, m: usize, ef_construction: usize) Self {
             return .{
                 .allocator = allocator,
                 .nodes = AutoHashMap(usize, Node).init(allocator),
@@ -57,33 +68,42 @@ pub fn HNSW(comptime T: type) type {
                 .max_level = 0,
                 .m = m,
                 .ef_construction = ef_construction,
-                .mutex = Mutex{},
+                .default_ef_search = @max(ef_construction, 64),
+                .dims = dims,
+                .string_table = .{},
+                .mutex = .{},
             };
         }
 
         pub fn deinit(self: *Self) void {
             var it = self.nodes.iterator();
-            while (it.next()) |entry| {
-                var node = entry.value_ptr;
-                node.deinit(self.allocator);
+            while (it.next()) |kv| {
+                kv.value_ptr.deinit(self.allocator);
             }
             self.nodes.deinit();
+            if (self.string_table.data.len > 0) {
+                self.allocator.free(self.string_table.data);
+            }
         }
 
-        pub fn insert(self: *Self, point: []const T) !void {
+        pub fn insert(self: *Self, point: []const T, meta: Metadata) !usize {
+            std.debug.assert(point.len == self.dims);
+
             self.mutex.lock();
             defer self.mutex.unlock();
 
             const id = self.nodes.count();
             const level = self.randomLevel();
-            var node = try Node.init(self.allocator, id, point, level);
+            const mf = try metadata.encode(Metadata, meta, &self.string_table, self.allocator);
+
+            var node = try Node.init(self.allocator, id, point, level, mf);
             errdefer node.deinit(self.allocator);
 
             try self.nodes.put(id, node);
 
             if (self.entry_point) |entry| {
                 var ep_copy = entry;
-                var curr_dist = distance(node.point, self.nodes.get(ep_copy).?.point);
+                var curr_dist = dist(node.point, self.nodes.get(ep_copy).?.point);
 
                 for (0..self.max_level + 1) |layer| {
                     var changed = true;
@@ -93,10 +113,10 @@ pub fn HNSW(comptime T: type) type {
                         if (layer < curr_node.connections.len) {
                             for (curr_node.connections[layer].items) |neighbor_id| {
                                 const neighbor = self.nodes.get(neighbor_id).?;
-                                const dist = distance(node.point, neighbor.point);
-                                if (dist < curr_dist) {
+                                const d = dist(node.point, neighbor.point);
+                                if (d < curr_dist) {
                                     ep_copy = neighbor_id;
-                                    curr_dist = dist;
+                                    curr_dist = d;
                                     changed = true;
                                 }
                             }
@@ -114,6 +134,8 @@ pub fn HNSW(comptime T: type) type {
             if (level > self.max_level) {
                 self.max_level = level;
             }
+
+            return id;
         }
 
         fn connect(self: *Self, source: usize, target: usize, level: usize) !void {
@@ -149,22 +171,17 @@ pub fn HNSW(comptime T: type) type {
             defer self.allocator.free(candidates);
             @memcpy(candidates, connections.items);
 
-            const Context = struct {
-                self: *Self,
-                node: *Node,
-            };
-            const context = Context{ .self = self, .node = node };
-
-            const compareFn = struct {
-                fn compare(ctx: Context, a: usize, b: usize) bool {
-                    const dist_a = distance(ctx.node.point, ctx.self.nodes.get(a).?.point);
-                    const dist_b = distance(ctx.node.point, ctx.self.nodes.get(b).?.point);
-                    return dist_a < dist_b;
+            const Ctx = struct { self: *Self, node: *Node };
+            const ctx = Ctx{ .self = self, .node = node };
+            const cmp = struct {
+                fn less(c: Ctx, a: usize, b: usize) bool {
+                    const da = dist(c.node.point, c.self.nodes.get(a).?.point);
+                    const db = dist(c.node.point, c.self.nodes.get(b).?.point);
+                    return da < db;
                 }
-            }.compare;
+            }.less;
 
-            std.sort.insertion(usize, candidates, context, compareFn);
-
+            std.sort.insertion(usize, candidates, ctx, cmp);
             connections.shrinkRetainingCapacity(self.m);
             @memcpy(connections.items, candidates[0..self.m]);
         }
@@ -172,76 +189,211 @@ pub fn HNSW(comptime T: type) type {
         fn randomLevel(self: *Self) usize {
             _ = self;
             var level: usize = 0;
-            const max_level = 31;
-            while (level < max_level and std.crypto.random.float(f32) < 0.5) {
+            const max_level_limit = 31;
+            while (level < max_level_limit and std.crypto.random.float(f32) < 0.5) {
                 level += 1;
             }
             return level;
         }
 
-        fn distance(a: []const T, b: []const T) T {
-            if (a.len != b.len) {
-                @panic("Mismatched dimensions in distance calculation");
-            }
-            var sum: T = 0;
-            for (a, 0..) |_, i| {
-                const diff = a[i] - b[i];
-                sum += diff * diff;
-            }
-            return sum; // Note: We're returning squared distance for efficiency
-        }
-
-        pub fn search(self: *Self, query: []const T, k: usize) ![]const Node {
+        pub fn searchTopK(self: *Self, query: []const T, k: usize, ef_search_param: usize) ![]search.SearchResult(T) {
+            std.debug.assert(query.len == self.dims);
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            var result = try ArrayList(Node).initCapacity(self.allocator, k);
-            errdefer result.deinit(self.allocator);
-
-            if (self.entry_point) |entry| {
-                var candidates = std.PriorityQueue(CandidateNode, void, CandidateNode.lessThan).init(self.allocator, {});
-                defer candidates.deinit();
-
-                var visited = std.AutoHashMap(usize, void).init(self.allocator);
-                defer visited.deinit();
-
-                try candidates.add(.{ .id = entry, .distance = distance(query, self.nodes.get(entry).?.point) });
-                try visited.put(entry, {});
-
-                while (candidates.count() > 0 and result.items.len < k) {
-                    const current = candidates.remove();
-                    const current_node = self.nodes.get(current.id).?;
-                    try result.append(self.allocator, current_node);
-
-                    for (current_node.connections[0].items) |neighbor_id| {
-                        if (!visited.contains(neighbor_id)) {
-                            const neighbor = self.nodes.get(neighbor_id).?;
-                            const dist = distance(query, neighbor.point);
-                            try candidates.add(.{ .id = neighbor_id, .distance = dist });
-                            try visited.put(neighbor_id, {});
-                        }
-                    }
-                }
-            }
-
-            const Context = struct {
-                query: []const T,
-                pub fn lessThan(ctx: @This(), a: Node, b: Node) bool {
-                    return distance(ctx.query, a.point) < distance(ctx.query, b.point);
-                }
-            };
-            std.sort.insertion(Node, result.items, Context{ .query = query }, Context.lessThan);
-
-            return result.toOwnedSlice(self.allocator);
+            return try search.topK(
+                T,
+                self.nodes,
+                self.entry_point,
+                self.max_level,
+                ef_search_param,
+                dist,
+                query,
+                k,
+                self.allocator,
+            );
         }
 
-        const CandidateNode = struct {
-            id: usize,
-            distance: T,
+        pub fn searchDefault(self: *Self, query: []const T, k: usize) ![]search.SearchResult(T) {
+            return self.searchTopK(query, k, self.default_ef_search);
+        }
 
-            fn lessThan(_: void, a: CandidateNode, b: CandidateNode) std.math.Order {
-                return std.math.order(a.distance, b.distance);
+        /// Search with a filter predicate applied during traversal.
+        /// Still visits neighbors of filtered-out nodes to preserve graph reachability.
+        pub fn searchFiltered(
+            self: *Self,
+            query: []const T,
+            k: usize,
+            ef_search_param: usize,
+            ctx: anytype,
+            comptime pred: fn (@TypeOf(ctx), MetaFixed) bool,
+        ) ![]search.SearchResult(T) {
+            std.debug.assert(query.len == self.dims);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            return try search.topKFiltered(
+                T,
+                MetaFixed,
+                @TypeOf(ctx),
+                self.nodes,
+                self.entry_point,
+                self.max_level,
+                ef_search_param,
+                dist,
+                query,
+                k,
+                ctx,
+                pred,
+                self.allocator,
+            );
+        }
+
+        pub fn getStringTable(self: *const Self) *const metadata.StringTable {
+            return &self.string_table;
+        }
+
+        pub fn getNode(self: *const Self, id: usize) ?*const Node {
+            return self.nodes.getPtr(id);
+        }
+
+        pub fn getMetadata(self: *const Self, id: usize) ?Metadata {
+            const node = self.nodes.getPtr(id) orelse return null;
+            return metadata.decode(Metadata, node.meta_fixed, &self.string_table);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.nodes.count();
+        }
+
+        /// Save the entire index to a file
+        pub fn save(self: *Self, path: []const u8) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const node_count = self.nodes.count();
+
+            // Build header
+            const entry_raw: u64 = if (self.entry_point) |ep| @intCast(ep) else std.math.maxInt(u64);
+
+            const header: persistence.FileHeader = .{
+                .metric = @intCast(@intFromEnum(metric)),
+                .t_size = @intCast(@sizeOf(T)),
+                .dims = @intCast(self.dims),
+                .m = @intCast(self.m),
+                .ef_construction = @intCast(self.ef_construction),
+                .node_count = @intCast(node_count),
+                .entry_point = entry_raw,
+                .max_level = @intCast(self.max_level),
+                .string_blob_len = @intCast(self.string_table.data.len),
+            };
+
+            // Serialize sections
+            const vectors_bytes = try persistence.serializeVectors(T, self.nodes, node_count, self.dims, self.allocator);
+            defer if (vectors_bytes.len > 0) self.allocator.free(vectors_bytes);
+
+            const metas_bytes = try persistence.serializeMetadata(MetaFixed, self.nodes, node_count, self.allocator);
+            defer if (metas_bytes.len > 0) self.allocator.free(metas_bytes);
+
+            const graph_bytes = try persistence.serializeGraph(self.nodes, node_count, self.allocator);
+            defer if (graph_bytes.len > 0) self.allocator.free(graph_bytes);
+
+            try persistence.save(path, header, vectors_bytes, metas_bytes, graph_bytes, self.string_table.data);
+        }
+
+        /// Load an index from a file
+        pub fn load(allocator: Allocator, path: []const u8) !Self {
+            const header = try persistence.loadHeader(path);
+
+            // Validate compile-time compatibility
+            if (header.metric != @as(u8, @intCast(@intFromEnum(metric)))) return error.MetricMismatch;
+            if (header.t_size != @as(u8, @intCast(@sizeOf(T)))) return error.TypeSizeMismatch;
+
+            var g = Self.init(allocator, header.dims, header.m, header.ef_construction);
+            errdefer g.deinit();
+            g.max_level = header.max_level;
+
+            // Open file and read past header
+            const file = try std.fs.cwd().openFile(path, .{});
+            defer file.close();
+
+            var buf: [4096]u8 = undefined;
+            var reader = file.reader(&buf);
+
+            // Skip header
+            _ = try reader.interface.takeStruct(persistence.FileHeader, .little);
+
+            const node_count: usize = @intCast(header.node_count);
+            const dims: usize = @intCast(header.dims);
+            const t_size: usize = header.t_size;
+            const vec_len: usize = node_count * dims * t_size;
+            const mf_size: usize = @sizeOf(MetaFixed);
+            const metas_len: usize = node_count * mf_size;
+            const string_len: usize = @intCast(header.string_blob_len);
+
+            // Compute graph size from file size
+            const stat = try file.stat();
+            const header_size: usize = @sizeOf(persistence.FileHeader);
+            const total_size: usize = @intCast(stat.size);
+            if (total_size < header_size + vec_len + metas_len + string_len) return error.SizeMismatch;
+            const graph_len: usize = total_size - header_size - vec_len - metas_len - string_len;
+
+            // Read sections
+            const vectors_bytes = try allocator.alloc(u8, vec_len);
+            defer if (vectors_bytes.len > 0) allocator.free(vectors_bytes);
+            if (vec_len > 0) try reader.interface.readSliceAll(vectors_bytes);
+
+            const metas_bytes = try allocator.alloc(u8, metas_len);
+            defer if (metas_bytes.len > 0) allocator.free(metas_bytes);
+            if (metas_len > 0) try reader.interface.readSliceAll(metas_bytes);
+
+            const graph_bytes = try allocator.alloc(u8, graph_len);
+            defer if (graph_bytes.len > 0) allocator.free(graph_bytes);
+            if (graph_len > 0) try reader.interface.readSliceAll(graph_bytes);
+
+            // Read string blob
+            if (string_len > 0) {
+                g.string_table.data = try allocator.alloc(u8, string_len);
+                try reader.interface.readSliceAll(g.string_table.data);
             }
-        };
+
+            // Deserialize sections
+            const points = try persistence.deserializeVectors(T, vectors_bytes, node_count, dims, allocator);
+            defer allocator.free(points); // Outer slice only; inner slices moved to nodes
+
+            const metas = try persistence.deserializeMetadata(MetaFixed, metas_bytes, node_count, allocator);
+            defer if (metas.len > 0) allocator.free(metas);
+
+            const conns = try persistence.deserializeGraph(graph_bytes, node_count, allocator);
+            defer if (conns.len > 0) allocator.free(conns);
+
+            // Assemble nodes
+            for (0..node_count) |id| {
+                const node = Node{
+                    .id = id,
+                    .point = points[id], // Takes ownership
+                    .meta_fixed = metas[id],
+                    .connections = conns[id], // Takes ownership
+                    .mutex = .{},
+                };
+                try g.nodes.put(id, node);
+            }
+
+            // Entry point
+            if (node_count == 0) {
+                g.entry_point = null;
+            } else {
+                const ep_raw = header.entry_point;
+                if (ep_raw == std.math.maxInt(u64)) {
+                    g.entry_point = null;
+                } else {
+                    if (ep_raw >= header.node_count) return error.InvalidEntryPoint;
+                    g.entry_point = @intCast(ep_raw);
+                }
+            }
+
+            g.default_ef_search = @max(g.ef_construction, 64);
+            return g;
+        }
     };
 }
