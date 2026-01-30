@@ -14,9 +14,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // Create a module for the library
-    const lib_module = b.addModule("zvdb", .{
-        .root_source_file = b.path("src/zvdb.zig"),
-    });
+    // const lib_module = b.addModule("zvdb", .{
+    //     .root_source_file = b.path("src/zvdb.zig"),
+    // });
 
     // Add unit tests
     // const unit_tests = b.addTest(.{
