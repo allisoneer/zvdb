@@ -18,6 +18,14 @@ pub fn build(b: *std.Build) void {
     //     .root_source_file = b.path("src/zvdb.zig"),
     // });
 
+    const hnsw_tests = b.addTest(.{
+        .root_source_file = b.path("src/test_hnsw.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_hnsw_tests = b.addRunArtifact(hnsw_tests);
+    const hnsw_test_step = b.step("hnsw-test", "Run hnsw-tests");
+    hnsw_test_step.dependOn(&run_hnsw_tests.step);
     // Add unit tests
     // const unit_tests = b.addTest(.{
     //     .root_source_file = b.path("tests/unit/main.zig"),
