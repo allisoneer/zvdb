@@ -144,7 +144,7 @@ test "HNSWv2 save/load empty index" {
         defer idx.deinit();
 
         try testing.expectEqual(@as(usize, 0), idx.count());
-        try testing.expect(idx.entry_point == null);
+        try testing.expect(idx.entryPoint() == null);
     }
 
     std.fs.cwd().deleteFile(path) catch {};

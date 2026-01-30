@@ -28,7 +28,7 @@ const MockGraph = struct {
     }
 
     pub fn getPoint(self: *const MockGraph, id: u32) []const f32 {
-        return &self.pts[id];
+        return self.pts[@as(usize, id)][0..];
     }
 
     pub fn getNeighborsSlice(self: *const MockGraph, id: u32, level: usize) []const u32 {
@@ -148,6 +148,27 @@ test "search2 k=0 returns empty" {
         10,
         &q,
         0, // k=0
+        testing.allocator,
+        &graph,
+    );
+    defer testing.allocator.free(res);
+
+    try testing.expectEqual(@as(usize, 0), res.len);
+}
+
+test "search2 ef_search=0 returns empty" {
+    const graph = MockGraph{};
+    const q = [_]f32{ 0, 0 };
+
+    const res = try s2.topK2(
+        f32,
+        *const MockGraph,
+        5,
+        0,
+        0,
+        0, // ef_search=0
+        &q,
+        2,
         testing.allocator,
         &graph,
     );

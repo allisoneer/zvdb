@@ -110,24 +110,36 @@ pub fn loadSectionsV2(path: []const u8, header: FileHeaderV2, allocator: std.mem
     };
     errdefer sections.deinit();
 
+    const max_usize = std.math.maxInt(usize);
+
     if (header.vectors_len > 0) {
-        sections.vectors = try allocator.alloc(u8, header.vectors_len);
+        if (header.vectors_len > max_usize) return error.LengthOverflow;
+        const vlen: usize = @intCast(header.vectors_len);
+        sections.vectors = try allocator.alloc(u8, vlen);
         try reader.interface.readSliceAll(sections.vectors);
     }
     if (header.metadata_len > 0) {
-        sections.metadata = try allocator.alloc(u8, header.metadata_len);
+        if (header.metadata_len > max_usize) return error.LengthOverflow;
+        const mlen: usize = @intCast(header.metadata_len);
+        sections.metadata = try allocator.alloc(u8, mlen);
         try reader.interface.readSliceAll(sections.metadata);
     }
     if (header.levels_len > 0) {
-        sections.levels = try allocator.alloc(u8, header.levels_len);
+        if (header.levels_len > max_usize) return error.LengthOverflow;
+        const llen: usize = @intCast(header.levels_len);
+        sections.levels = try allocator.alloc(u8, llen);
         try reader.interface.readSliceAll(sections.levels);
     }
     if (header.tape_len > 0) {
-        sections.tape = try allocator.alloc(u8, header.tape_len);
+        if (header.tape_len > max_usize) return error.LengthOverflow;
+        const tlen: usize = @intCast(header.tape_len);
+        sections.tape = try allocator.alloc(u8, tlen);
         try reader.interface.readSliceAll(sections.tape);
     }
     if (header.string_blob_len > 0) {
-        sections.string_blob = try allocator.alloc(u8, header.string_blob_len);
+        if (header.string_blob_len > max_usize) return error.LengthOverflow;
+        const slen: usize = @intCast(header.string_blob_len);
+        sections.string_blob = try allocator.alloc(u8, slen);
         try reader.interface.readSliceAll(sections.string_blob);
     }
 

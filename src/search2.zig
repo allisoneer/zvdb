@@ -27,7 +27,7 @@ pub fn topK2(
     allocator: std.mem.Allocator,
     ctx: Context,
 ) ![]SearchResult(T) {
-    if (entry_point == null or k == 0 or node_count == 0) return &.{};
+    if (entry_point == null or k == 0 or node_count == 0 or ef_search == 0) return &.{};
 
     var visited = try std.DynamicBitSet.initEmpty(allocator, node_count);
     defer visited.deinit();
@@ -73,7 +73,7 @@ pub fn topK2(
     defer results.deinit();
 
     try candidates.add(.{ .id = ep, .distance = ep_dist });
-    visited.set(ep);
+    visited.set(@as(usize, ep));
     if (!ctx.isDeleted(ep)) try results.add(.{ .id = ep, .distance = ep_dist });
 
     while (candidates.count() > 0) {
@@ -82,8 +82,8 @@ pub fn topK2(
 
         const neighbors = ctx.getNeighborsSlice(c.id, 0);
         for (neighbors) |nb| {
-            if (visited.isSet(nb)) continue;
-            visited.set(nb);
+            if (visited.isSet(@as(usize, nb))) continue;
+            visited.set(@as(usize, nb));
 
             const d = ctx.dist(query, ctx.getPoint(nb));
             try candidates.add(.{ .id = nb, .distance = d });

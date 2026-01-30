@@ -19,9 +19,14 @@ pub const GraphTape = struct {
 
     /// Allocate space for a node at the given level.
     /// Returns the offset into the tape where the node's data starts.
+    /// Returns error.TapeOverflow if allocation would exceed u32 address space.
     pub fn allocateNode(self: *GraphTape, level: u16) !u32 {
         const node_size = self.config.nodeGraphBytes(level);
-        const off: u32 = @intCast(self.data.items.len);
+        const max = std.math.maxInt(u32);
+        const cur_len = self.data.items.len;
+        if (cur_len > max) return error.TapeOverflow;
+        if (node_size > max or cur_len > max - node_size) return error.TapeOverflow;
+        const off: u32 = @intCast(cur_len);
         try self.data.appendNTimes(self.allocator, 0, node_size);
         return off;
     }

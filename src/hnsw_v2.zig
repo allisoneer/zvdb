@@ -41,6 +41,7 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
         string_table: if (has_metadata) metadata.StringTable else void =
             if (has_metadata) .{} else {},
         free_slots: std.ArrayListUnmanaged(u32) = .{},
+        free_vector_slots: std.ArrayListUnmanaged(u32) = .{},
         entry_point: ?u32 = null,
         max_level: u16 = 0,
         prng: std.Random.Xoshiro256,
@@ -60,9 +61,10 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
         pub fn deinit(self: *Self) void {
             self.nodes.deinit(self.allocator);
             self.free_slots.deinit(self.allocator);
+            self.free_vector_slots.deinit(self.allocator);
             if (has_metadata) {
                 self.metadata_store.deinit(self.allocator);
-                if (self.string_table.data.len > 0) self.allocator.free(self.string_table.data);
+                self.string_table.deinit(self.allocator);
             }
             self.graph_tape.deinit();
             self.vectors.deinit();
@@ -78,6 +80,11 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
                 if (!n.deleted) c += 1;
             }
             return c;
+        }
+
+        /// Get the current entry point (root node for search).
+        pub fn entryPoint(self: *const Self) ?u32 {
+            return self.entry_point;
         }
 
         /// Random level generation using ctz trick (fast Xoshiro256).
@@ -164,8 +171,16 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
             else
                 @intCast(self.nodes.items.len);
 
-            // Store vector
-            const vslot = try self.vectors.add(std.mem.sliceAsBytes(point));
+            // Acquire vector slot (reuse if available)
+            const vslot: u32 = blk: {
+                if (self.config.reuse_deleted_slots and self.free_vector_slots.items.len > 0) {
+                    const reused_slot = self.free_vector_slots.pop().?;
+                    self.vectors.set(reused_slot, std.mem.sliceAsBytes(point));
+                    break :blk reused_slot;
+                } else {
+                    break :blk try self.vectors.add(std.mem.sliceAsBytes(point));
+                }
+            };
 
             // Node level and tape allocation
             const level = self.randomLevel();
@@ -320,7 +335,10 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
             if (id >= self.nodes.items.len) return error.InvalidId;
             if (self.nodes.items[id].deleted) return error.AlreadyDeleted;
             self.nodes.items[id].deleted = true;
-            if (self.config.reuse_deleted_slots) try self.free_slots.append(self.allocator, id);
+            if (self.config.reuse_deleted_slots) {
+                try self.free_slots.append(self.allocator, id);
+                try self.free_vector_slots.append(self.allocator, self.nodes.items[id].vector_slot);
+            }
             if (self.entry_point == id) self.entry_point = self.findNewEntryPoint(id);
         }
 
@@ -395,6 +413,7 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
                 // All nodes deleted - reset to empty state
                 self.nodes.clearRetainingCapacity();
                 self.free_slots.clearRetainingCapacity();
+                self.free_vector_slots.clearRetainingCapacity();
                 if (has_metadata) self.metadata_store.clearRetainingCapacity();
                 self.graph_tape.data.clearRetainingCapacity();
                 self.vectors.count = 0;
@@ -450,6 +469,7 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
             if (has_metadata) {
                 try new_meta.ensureTotalCapacity(self.allocator, live_count);
             }
+            errdefer if (has_metadata) new_meta.deinit(self.allocator);
 
             // Copy nodes in new order
             for (slots) |s| {
@@ -513,6 +533,7 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
             self.vectors.deinit();
             self.graph_tape.deinit();
             self.free_slots.clearRetainingCapacity();
+            self.free_vector_slots.clearRetainingCapacity();
             if (has_metadata) {
                 self.metadata_store.deinit(self.allocator);
                 self.metadata_store = new_meta;

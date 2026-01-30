@@ -19,6 +19,12 @@ pub const StringTable = struct {
             self.data = try allocator.realloc(self.data, new_len);
         }
     }
+
+    /// Free the string table data.
+    pub fn deinit(self: *StringTable, allocator: std.mem.Allocator) void {
+        if (self.data.len > 0) allocator.free(self.data);
+        self.data = &.{};
+    }
 };
 
 // =============================================================================
@@ -32,7 +38,7 @@ fn isString(comptime T: type) bool {
     };
 }
 
-fn isEnumWithExplicitTag(comptime T: type) bool {
+fn isIntegerBackedEnum(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"enum" => |e| switch (@typeInfo(e.tag_type)) {
             .int => true,
@@ -45,7 +51,7 @@ fn isEnumWithExplicitTag(comptime T: type) bool {
 fn isPrimitive(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .int, .float, .bool => true,
-        .@"enum" => isEnumWithExplicitTag(T),
+        .@"enum" => isIntegerBackedEnum(T),
         else => false,
     };
 }
@@ -81,8 +87,8 @@ fn validateSupportedField(comptime T: type, comptime field_path: []const u8) voi
             }
         },
         .@"enum" => {
-            if (!isEnumWithExplicitTag(T)) {
-                @compileError("Enum without explicit integer tag type not supported at '" ++ field_path ++ "'");
+            if (!isIntegerBackedEnum(T)) {
+                @compileError("Enum with non-integer tag type not supported at '" ++ field_path ++ "'");
             }
         },
         .int, .float, .bool => {},
