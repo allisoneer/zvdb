@@ -8,12 +8,12 @@ pub fn runSingleThreadedBenchmarks(allocator: std.mem.Allocator, config: shared.
     for (config.dimensions) |dim| {
         // Insertion benchmark
         const insertion_result = try shared.runInsertionBenchmark(allocator, config.num_points, dim, null);
-        std.debug.print("{}\n", .{insertion_result});
+        std.debug.print("{f}\n", .{insertion_result});
 
         // Search benchmarks
         for (config.k_values) |k| {
             const search_result = try shared.runSearchBenchmark(allocator, config.num_points, dim, config.num_queries, k, null);
-            std.debug.print("{}\n", .{search_result});
+            std.debug.print("{f}\n", .{search_result});
         }
 
         std.debug.print("\n", .{});

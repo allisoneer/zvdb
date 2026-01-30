@@ -1,12 +1,12 @@
 .{
-    .name = "zvdb",
+    .name = .zvdb,
+    .fingerprint = 0xd79725d1b0e1aab0,
 
     // Is it even 0.0.0 right now if we're being honest??
     .version = "0.0.0",
 
 
-    // probably not accurate but at least higher than 11. We are on master branch 14.lahfdaifh1.
-    .minimum_zig_version = "0.13.0",
+    .minimum_zig_version = "0.15.0",
 
     .dependencies = .{},
 

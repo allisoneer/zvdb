@@ -19,7 +19,7 @@ pub fn HNSW(comptime T: type) type {
                 const connections = try allocator.alloc(ArrayList(usize), level + 1);
                 errdefer allocator.free(connections);
                 for (connections) |*conn| {
-                    conn.* = ArrayList(usize).init(allocator);
+                    conn.* = .{};
                 }
                 const owned_point = try allocator.alloc(T, point.len);
                 errdefer allocator.free(owned_point);
@@ -34,7 +34,7 @@ pub fn HNSW(comptime T: type) type {
 
             fn deinit(self: *Node, allocator: Allocator) void {
                 for (self.connections) |*conn| {
-                    conn.deinit();
+                    conn.deinit(allocator);
                 }
                 allocator.free(self.connections);
                 allocator.free(self.point);
@@ -126,10 +126,10 @@ pub fn HNSW(comptime T: type) type {
             defer target_node.mutex.unlock();
 
             if (level < source_node.connections.len) {
-                try source_node.connections[level].append(target);
+                try source_node.connections[level].append(self.allocator, target);
             }
             if (level < target_node.connections.len) {
-                try target_node.connections[level].append(source);
+                try target_node.connections[level].append(self.allocator, source);
             }
 
             if (level < source_node.connections.len) {
@@ -196,7 +196,7 @@ pub fn HNSW(comptime T: type) type {
             defer self.mutex.unlock();
 
             var result = try ArrayList(Node).initCapacity(self.allocator, k);
-            errdefer result.deinit();
+            errdefer result.deinit(self.allocator);
 
             if (self.entry_point) |entry| {
                 var candidates = std.PriorityQueue(CandidateNode, void, CandidateNode.lessThan).init(self.allocator, {});
@@ -211,7 +211,7 @@ pub fn HNSW(comptime T: type) type {
                 while (candidates.count() > 0 and result.items.len < k) {
                     const current = candidates.remove();
                     const current_node = self.nodes.get(current.id).?;
-                    try result.append(current_node);
+                    try result.append(self.allocator, current_node);
 
                     for (current_node.connections[0].items) |neighbor_id| {
                         if (!visited.contains(neighbor_id)) {
@@ -232,7 +232,7 @@ pub fn HNSW(comptime T: type) type {
             };
             std.sort.insertion(Node, result.items, Context{ .query = query }, Context.lessThan);
 
-            return result.toOwnedSlice();
+            return result.toOwnedSlice(self.allocator);
         }
 
         const CandidateNode = struct {

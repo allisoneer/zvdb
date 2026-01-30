@@ -11,12 +11,12 @@ pub fn runMultiThreadedBenchmarks(allocator: std.mem.Allocator, config: shared.B
         for (thread_counts) |thread_count| {
             // Insertion benchmark
             const insertion_result = try shared.runInsertionBenchmark(allocator, config.num_points, dim, thread_count);
-            std.debug.print("{}\n", .{insertion_result});
+            std.debug.print("{f}\n", .{insertion_result});
 
             // Search benchmarks
             for (config.k_values) |k| {
                 const search_result = try shared.runSearchBenchmark(allocator, config.num_points, dim, config.num_queries, k, thread_count);
-                std.debug.print("{}\n", .{search_result});
+                std.debug.print("{f}\n", .{search_result});
             }
 
             std.debug.print("\n", .{});

@@ -4,24 +4,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main library
-    const lib = b.addStaticLibrary(.{
-        .name = "zvdb",
+    // Main library module (Zig 0.15+ requires root_module pattern)
+    const lib_module = b.addModule("zvdb", .{
         .root_source_file = b.path("src/zvdb.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    const lib = b.addLibrary(.{
+        .name = "zvdb",
+        .root_module = lib_module,
     });
     b.installArtifact(lib);
 
-    // Create a module for the library
-    const lib_module = b.addModule("zvdb", .{
-        .root_source_file = b.path("src/zvdb.zig"),
-    });
-
     const hnsw_tests = b.addTest(.{
-        .root_source_file = b.path("src/test_hnsw.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_hnsw.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     const run_hnsw_tests = b.addRunArtifact(hnsw_tests);
 
@@ -50,13 +50,16 @@ pub fn build(b: *std.Build) void {
 
     // Benchmarks:
     // Single-threaded benchmarks
-    const single_threaded_benchmarks = b.addExecutable(.{
-        .name = "single_threaded_benchmarks",
+    const single_threaded_mod = b.createModule(.{
         .root_source_file = b.path("benchmarks/single_threaded_benchmarks.zig"),
         .target = target,
         .optimize = optimize,
     });
-    single_threaded_benchmarks.root_module.addImport("zvdb", lib_module);
+    single_threaded_mod.addImport("zvdb", lib_module);
+    const single_threaded_benchmarks = b.addExecutable(.{
+        .name = "single_threaded_benchmarks",
+        .root_module = single_threaded_mod,
+    });
     b.installArtifact(single_threaded_benchmarks);
 
     const run_single_threaded = b.addRunArtifact(single_threaded_benchmarks);
@@ -67,13 +70,16 @@ pub fn build(b: *std.Build) void {
     run_single_threaded_step.dependOn(&run_single_threaded.step);
 
     // Multi-threaded benchmarks
-    const multi_threaded_benchmarks = b.addExecutable(.{
-        .name = "multi_threaded_benchmarks",
+    const multi_threaded_mod = b.createModule(.{
         .root_source_file = b.path("benchmarks/multi_threaded_benchmarks.zig"),
         .target = target,
         .optimize = optimize,
     });
-    multi_threaded_benchmarks.root_module.addImport("zvdb", lib_module);
+    multi_threaded_mod.addImport("zvdb", lib_module);
+    const multi_threaded_benchmarks = b.addExecutable(.{
+        .name = "multi_threaded_benchmarks",
+        .root_module = multi_threaded_mod,
+    });
     b.installArtifact(multi_threaded_benchmarks);
 
     const run_multi_threaded = b.addRunArtifact(multi_threaded_benchmarks);

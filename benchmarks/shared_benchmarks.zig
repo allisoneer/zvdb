@@ -13,12 +13,8 @@ pub const BenchmarkResult = struct {
 
     pub fn format(
         self: BenchmarkResult,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
-        _ = fmt;
-        _ = options;
 
         try writer.print("{s} Benchmark:\n", .{self.operation});
         try writer.print("  Points: {d}\n", .{self.num_points});
