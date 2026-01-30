@@ -316,65 +316,6 @@ test "HNSW - Consistency" {
     }
 }
 
-// TODO: Implement deletion
-// test "HNSW - Deletion" {
-//     const allocator = testing.allocator;
-//     var hnsw = HNSW(f32).init(allocator, 16, 200);
-//     defer hnsw.deinit();
-
-//     const num_points = 10;
-//     const dim = 3;
-
-//     // Insert points
-//     var points = try allocator.alloc([]f32, num_points);
-//     defer {
-//         for (points) |p| allocator.free(p);
-//         allocator.free(points);
-//     }
-
-//     for (0..num_points) |i| {
-//         points[i] = try randomPoint(allocator, dim);
-//         try hnsw.insert(points[i]);
-//         std.debug.print("Inserted point {d}\n", .{i});
-//     }
-
-//     // Delete every other point
-//     for (0..num_points, 0..) |i, id| {
-//         if (i % 2 == 0) {
-//             try hnsw.delete(id);
-//             std.debug.print("Deleted point {d}\n", .{id});
-//         }
-//     }
-
-//     // Verify that deleted points are not in search results
-//     const query = try randomPoint(allocator, dim);
-//     defer allocator.free(query);
-
-//     const results = try hnsw.search(query, num_points);
-//     defer allocator.free(results);
-
-//     std.debug.print("Search results:\n", .{});
-//     for (results) |result| {
-//         std.debug.print("Result ID: {d}\n", .{result.id});
-//         try testing.expect(result.id % 2 != 0);
-//     }
-
-//     // Verify that non-deleted points are still searchable
-//     for (1..num_points, 1..) |i, id| {
-//         if (i % 2 != 0) {
-//             std.debug.print("Searching for point {d}\n", .{id});
-//             const point_results = try hnsw.search(points[i], 1);
-//             defer allocator.free(point_results);
-//             if (point_results.len > 0) {
-//                 std.debug.print("Found result: {d}\n", .{point_results[0].id});
-//                 try testing.expectEqual(id, point_results[0].id);
-//             } else {
-//                 std.debug.print("No results found for point {d}\n", .{id});
-//             }
-//         }
-//     }
-// }
-
 test "HNSW - Performance Benchmarks" {
     const allocator = testing.allocator;
 
