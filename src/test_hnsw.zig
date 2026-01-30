@@ -151,55 +151,62 @@ test "HNSW - Memory Leaks" {
     // The ArenaAllocator will detect any memory leaks when it's deinitialized
 }
 
-// TODO: Get this working
-// test "HNSW - Concurrent Access" {
-//     const allocator = testing.allocator;
-//     var hnsw = HNSW(f32).init(allocator, 16, 200);
-//     defer hnsw.deinit();
+test "HNSW - Concurrent Access" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    defer hnsw.deinit();
 
-//     const num_threads = 4;
-//     const points_per_thread = 250;
-//     const dim = 64;
+    const num_threads = 8;
+    const points_per_thread = 1000;
+    const dim = 128;
 
-//     const ThreadContext = struct {
-//         hnsw: *HNSW(f32),
-//         allocator: std.mem.Allocator,
-//     };
+    const ThreadContext = struct {
+        hnsw: *HNSW(f32),
+        allocator: std.mem.Allocator,
+    };
 
-//     const thread_fn = struct {
-//         fn func(ctx: ThreadContext) !void {
-//             for (0..points_per_thread) |_| {
-//                 const point = try randomPoint(ctx.allocator, dim);
-//                 defer ctx.allocator.free(point);
-//                 try ctx.hnsw.insert(point);
-//             }
-//         }
-//     }.func;
+    const thread_fn = struct {
+        fn func(ctx: *const ThreadContext) !void {
+            for (0..points_per_thread) |_| {
+                const point = try ctx.allocator.alloc(f32, dim);
+                defer ctx.allocator.free(point);
+                for (point) |*v| {
+                    v.* = std.crypto.random.float(f32);
+                }
+                try ctx.hnsw.insert(point);
+            }
+        }
+    }.func;
 
-//     var threads: [num_threads]std.Thread = undefined;
-//     for (&threads) |*thread| {
-//         thread.* = try std.Thread.spawn(.{}, thread_fn, .{
-//             .hnsw = &hnsw,
-//             .allocator = allocator,
-//         });
-//     }
+    var threads: [num_threads]std.Thread = undefined;
+    var contexts: [num_threads]ThreadContext = undefined;
 
-//     for (&threads) |*thread| {
-//         thread.join();
-//     }
+    for (&threads, 0..) |*thread, i| {
+        contexts[i] = .{
+            .hnsw = &hnsw,
+            .allocator = allocator,
+        };
+        thread.* = try std.Thread.spawn(.{}, thread_fn, .{&contexts[i]});
+    }
 
-//     // Verify that all points were inserted
-//     try testing.expectEqual(@as(usize, num_threads * points_per_thread), hnsw.nodes.count());
+    for (&threads) |*thread| {
+        thread.join();
+    }
 
-//     // Test search after concurrent insertion
-//     const query = try randomPoint(allocator, dim);
-//     defer allocator.free(query);
+    // Verify that all points were inserted
+    const expected_count = num_threads * points_per_thread;
+    const actual_count = hnsw.nodes.count();
+    try testing.expectEqual(expected_count, actual_count);
 
-//     const results = try hnsw.search(query, 10);
-//     defer allocator.free(results);
+    // Test search after concurrent insertion
+    const query = try randomPoint(allocator, dim);
+    defer allocator.free(query);
 
-//     try testing.expectEqual(@as(usize, 10), results.len);
-// }
+    const results = try hnsw.search(query, 10);
+    defer allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 10), results.len);
+}
 
 test "HNSW - Stress Test" {
     const allocator = testing.allocator;

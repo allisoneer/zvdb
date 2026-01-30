@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
 const Order = std.math.Order;
+const Mutex = std.Thread.Mutex;
 
 pub fn HNSW(comptime T: type) type {
     return struct {
@@ -12,6 +13,7 @@ pub fn HNSW(comptime T: type) type {
             id: usize,
             point: []T,
             connections: []ArrayList(usize),
+            mutex: Mutex,
 
             fn init(allocator: Allocator, id: usize, point: []const T, level: usize) !Node {
                 const connections = try allocator.alloc(ArrayList(usize), level + 1);
@@ -26,6 +28,7 @@ pub fn HNSW(comptime T: type) type {
                     .id = id,
                     .point = owned_point,
                     .connections = connections,
+                    .mutex = Mutex{},
                 };
             }
 
@@ -44,6 +47,7 @@ pub fn HNSW(comptime T: type) type {
         max_level: usize,
         m: usize,
         ef_construction: usize,
+        mutex: Mutex,
 
         pub fn init(allocator: Allocator, m: usize, ef_construction: usize) Self {
             return .{
@@ -53,6 +57,7 @@ pub fn HNSW(comptime T: type) type {
                 .max_level = 0,
                 .m = m,
                 .ef_construction = ef_construction,
+                .mutex = Mutex{},
             };
         }
 
@@ -66,6 +71,9 @@ pub fn HNSW(comptime T: type) type {
         }
 
         pub fn insert(self: *Self, point: []const T) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             const id = self.nodes.count();
             const level = self.randomLevel();
             var node = try Node.init(self.allocator, id, point, level);
@@ -111,6 +119,11 @@ pub fn HNSW(comptime T: type) type {
         fn connect(self: *Self, source: usize, target: usize, level: usize) !void {
             var source_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
             var target_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
+
+            source_node.mutex.lock();
+            defer source_node.mutex.unlock();
+            target_node.mutex.lock();
+            defer target_node.mutex.unlock();
 
             if (level < source_node.connections.len) {
                 try source_node.connections[level].append(target);
@@ -179,6 +192,9 @@ pub fn HNSW(comptime T: type) type {
         }
 
         pub fn search(self: *Self, query: []const T, k: usize) ![]const Node {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             var result = try ArrayList(Node).initCapacity(self.allocator, k);
             errdefer result.deinit();
 
