@@ -1,5 +1,7 @@
 const std = @import("std");
-const HNSW = @import("zvdb").HNSW;
+const zvdb = @import("zvdb");
+const HNSW = zvdb.HNSW;
+const DistanceMetric = zvdb.DistanceMetric;
 
 pub const BenchmarkResult = struct {
     operation: []const u8,
@@ -55,7 +57,7 @@ pub fn randomPoint(allocator: std.mem.Allocator, dim: usize) ![]f32 {
 }
 
 pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: usize, num_threads: ?usize) !BenchmarkResult {
-    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, dim, 16, 200);
     defer hnsw.deinit();
 
     var timer = try std.time.Timer.start();
@@ -64,7 +66,7 @@ pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, di
     for (0..num_points) |_| {
         const point = try randomPoint(allocator, dim);
         defer allocator.free(point);
-        try hnsw.insert(point);
+        _ = try hnsw.insert(point, {});
     }
 
     const end = timer.lap();
@@ -84,14 +86,14 @@ pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, di
 }
 
 pub fn runSearchBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: usize, num_queries: usize, k: usize, num_threads: ?usize) !BenchmarkResult {
-    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, dim, 16, 200);
     defer hnsw.deinit();
 
     // Insert points
     for (0..num_points) |_| {
         const point = try randomPoint(allocator, dim);
         defer allocator.free(point);
-        try hnsw.insert(point);
+        _ = try hnsw.insert(point, {});
     }
 
     var timer = try std.time.Timer.start();
@@ -100,7 +102,7 @@ pub fn runSearchBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: 
     for (0..num_queries) |_| {
         const query = try randomPoint(allocator, dim);
         defer allocator.free(query);
-        const results = try hnsw.search(query, k);
+        const results = try hnsw.searchDefault(query, k);
         allocator.free(results);
     }
 
