@@ -97,6 +97,26 @@ test "HNSWv2 delete with slot reuse" {
     try testing.expectEqual(a, c);
 }
 
+test "HNSWv2 delete tombstone only (no slot reuse)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var idx = try h2.HNSWv2(f32, .squared_euclidean, void).init(gpa.allocator(), .{
+        .dims = 3,
+        .reuse_deleted_slots = false,
+    });
+    defer idx.deinit();
+
+    const a = try idx.insert(&[_]f32{ 1, 2, 3 }, {});
+    _ = try idx.insert(&[_]f32{ 4, 5, 6 }, {});
+    try idx.delete(a);
+
+    // Next insert should NOT reuse slot 'a', should get new slot
+    const c = try idx.insert(&[_]f32{ 7, 8, 9 }, {});
+    try testing.expect(c != a);
+    try testing.expectEqual(@as(u32, 2), c); // Should be slot 2
+}
+
 test "HNSWv2 metadata retrieval" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

@@ -56,10 +56,18 @@ pub fn randomPoint(allocator: std.mem.Allocator, dim: usize) ![]f32 {
 }
 
 pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: usize, num_threads: ?usize) !BenchmarkResult {
-    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, dim, 16, 200);
+    // HNSWv2: single-threaded by design, num_threads is ignored
+    _ = num_threads;
+
+    var hnsw = try HNSW(f32, .squared_euclidean, void).init(allocator, .{
+        .dims = @intCast(dim),
+        .m = 16,
+        .m_base = 32,
+        .ef_construction = 200,
+    });
     defer hnsw.deinit();
 
-    // Prepare batch of points
+    // Prepare points
     const points = try allocator.alloc([]f32, num_points);
     defer allocator.free(points);
     for (points) |*p| {
@@ -67,20 +75,13 @@ pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, di
     }
     defer for (points) |p| allocator.free(p);
 
-    // Prepare void metadata
-    const metas = try allocator.alloc(void, num_points);
-    defer allocator.free(metas);
-    for (metas) |*m| m.* = {};
-
-    // Convert to const slices for insertBatch
-    const const_points: []const []const f32 = @ptrCast(points);
-
     var timer = try std.time.Timer.start();
     const start = timer.lap();
 
-    // Use insertBatchThreaded for parallel insertion with explicit thread count
-    const ids = try hnsw.insertBatchThreaded(const_points, metas, num_threads);
-    defer allocator.free(ids);
+    // Single-threaded insertion loop (HNSWv2 is single-threaded by design)
+    for (points) |p| {
+        _ = try hnsw.insert(p, {});
+    }
 
     const end = timer.lap();
     const elapsed_ns = end - start;
@@ -92,85 +93,45 @@ pub fn runInsertionBenchmark(allocator: std.mem.Allocator, num_points: usize, di
         .dimensions = dim,
         .num_queries = null,
         .k = null,
-        .num_threads = num_threads,
+        .num_threads = 1, // HNSWv2 is single-threaded
         .total_time_ns = elapsed_ns,
         .operations_per_second = points_per_second,
     };
 }
 
 pub fn runSearchBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: usize, num_queries: usize, k: usize, num_threads: ?usize) !BenchmarkResult {
-    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, dim, 16, 200);
+    // HNSWv2: single-threaded by design, num_threads is ignored
+    _ = num_threads;
+
+    var hnsw = try HNSW(f32, .squared_euclidean, void).init(allocator, .{
+        .dims = @intCast(dim),
+        .m = 16,
+        .m_base = 32,
+        .ef_construction = 200,
+    });
     defer hnsw.deinit();
 
-    // Insert points using batch
+    // Insert points
     {
         const points = try allocator.alloc([]f32, num_points);
         defer allocator.free(points);
         for (points) |*p| p.* = try randomPoint(allocator, dim);
         defer for (points) |p| allocator.free(p);
 
-        const metas = try allocator.alloc(void, num_points);
-        defer allocator.free(metas);
-        for (metas) |*m| m.* = {};
-
-        const const_points: []const []const f32 = @ptrCast(points);
-        const ids = try hnsw.insertBatch(const_points, metas);
-        allocator.free(ids);
-    }
-
-    const threads = num_threads orelse 1;
-    const queries_per_thread = (num_queries + threads - 1) / threads;
-
-    const ThreadCtx = struct {
-        hnsw: *HNSW(f32, .squared_euclidean, void),
-        allocator: std.mem.Allocator,
-        query_count: usize,
-        dim: usize,
-        k: usize,
-    };
-
-    const thread_fn = struct {
-        fn run(ctx: *const ThreadCtx) void {
-            for (0..ctx.query_count) |_| {
-                const query = randomPoint(ctx.allocator, ctx.dim) catch continue;
-                defer ctx.allocator.free(query);
-                const results = ctx.hnsw.searchDefault(query, ctx.k) catch continue;
-                ctx.allocator.free(results);
-            }
+        for (points) |p| {
+            _ = try hnsw.insert(p, {});
         }
-    }.run;
+    }
 
     var timer = try std.time.Timer.start();
     const start = timer.lap();
 
-    if (threads == 1) {
-        // Single-threaded path
-        for (0..num_queries) |_| {
-            const query = try randomPoint(allocator, dim);
-            defer allocator.free(query);
-            const results = try hnsw.searchDefault(query, k);
-            allocator.free(results);
-        }
-    } else {
-        // Multi-threaded path
-        var thread_handles = try allocator.alloc(std.Thread, threads);
-        defer allocator.free(thread_handles);
-        var contexts = try allocator.alloc(ThreadCtx, threads);
-        defer allocator.free(contexts);
-
-        for (0..threads) |i| {
-            const remaining = num_queries -| (i * queries_per_thread);
-            contexts[i] = .{
-                .hnsw = &hnsw,
-                .allocator = allocator,
-                .query_count = @min(queries_per_thread, remaining),
-                .dim = dim,
-                .k = k,
-            };
-            thread_handles[i] = try std.Thread.spawn(.{}, thread_fn, .{&contexts[i]});
-        }
-
-        for (thread_handles) |*t| t.join();
+    // Single-threaded search
+    for (0..num_queries) |_| {
+        const query = try randomPoint(allocator, dim);
+        defer allocator.free(query);
+        const results = try hnsw.search(query, k);
+        allocator.free(results);
     }
 
     const end = timer.lap();
@@ -183,7 +144,7 @@ pub fn runSearchBenchmark(allocator: std.mem.Allocator, num_points: usize, dim: 
         .dimensions = dim,
         .num_queries = num_queries,
         .k = k,
-        .num_threads = num_threads,
+        .num_threads = 1, // HNSWv2 is single-threaded
         .total_time_ns = elapsed_ns,
         .operations_per_second = queries_per_second,
     };

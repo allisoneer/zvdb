@@ -347,6 +347,196 @@ pub fn HNSWv2(comptime T: type, comptime metric: dist_mod.DistanceMetric, compti
         }
 
         // =====================================================================
+        // Compaction
+        // =====================================================================
+
+        /// Find the cluster center for a node via greedy descent from entry point.
+        /// Used for cluster-based ordering during compaction.
+        fn findCluster(self: *Self, node_id: u32) u32 {
+            if (self.entry_point == null) return node_id;
+            const node_point = self.getPoint(node_id);
+
+            var current = self.entry_point.?;
+            var current_dist = distFn(node_point, self.getPoint(current));
+
+            // Greedy descent through all levels
+            var level = self.max_level;
+            while (true) {
+                var changed = true;
+                while (changed) {
+                    changed = false;
+                    const neighbors = self.getNeighborsSlice(current, level);
+                    for (neighbors) |nb| {
+                        const d = distFn(node_point, self.getPoint(nb));
+                        if (d < current_dist) {
+                            current = nb;
+                            current_dist = d;
+                            changed = true;
+                        }
+                    }
+                }
+                if (level == 0) break;
+                level -= 1;
+            }
+            return current;
+        }
+
+        /// Cluster-based compaction: removes deleted nodes and reorders remaining
+        /// nodes by (level desc, cluster) for better locality.
+        pub fn compact(self: *Self) !void {
+            // Count live nodes
+            var live_count: usize = 0;
+            for (self.nodes.items) |n| {
+                if (!n.deleted) live_count += 1;
+            }
+            if (live_count == self.nodes.items.len) return; // Nothing to compact
+
+            if (live_count == 0) {
+                // All nodes deleted - reset to empty state
+                self.nodes.clearRetainingCapacity();
+                self.free_slots.clearRetainingCapacity();
+                if (has_metadata) self.metadata_store.clearRetainingCapacity();
+                self.graph_tape.data.clearRetainingCapacity();
+                self.vectors.count = 0;
+                self.entry_point = null;
+                self.max_level = 0;
+                return;
+            }
+
+            const SlotInfo = struct { old_slot: u32, level: u16, cluster: u32 };
+            var slots = try self.allocator.alloc(SlotInfo, live_count);
+            defer self.allocator.free(slots);
+
+            // Gather live nodes with their clusters
+            var j: usize = 0;
+            for (self.nodes.items, 0..) |n, i| {
+                if (n.deleted) continue;
+                slots[j] = .{
+                    .old_slot = @intCast(i),
+                    .level = n.level,
+                    .cluster = self.findCluster(@intCast(i)),
+                };
+                j += 1;
+            }
+
+            // Sort by level desc, then cluster
+            std.sort.heap(SlotInfo, slots, {}, struct {
+                fn lessThan(_: void, a: SlotInfo, b: SlotInfo) bool {
+                    if (a.level != b.level) return a.level > b.level;
+                    return a.cluster < b.cluster;
+                }
+            }.lessThan);
+
+            // Build old → new mapping
+            var old_to_new = try self.allocator.alloc(u32, self.nodes.items.len);
+            defer self.allocator.free(old_to_new);
+            for (old_to_new) |*x| x.* = std.math.maxInt(u32);
+            for (slots, 0..) |s, new_idx| {
+                old_to_new[s.old_slot] = @intCast(new_idx);
+            }
+
+            // Create new containers
+            var new_nodes = std.ArrayListUnmanaged(Node){};
+            try new_nodes.ensureTotalCapacity(self.allocator, live_count);
+            errdefer new_nodes.deinit(self.allocator);
+
+            var new_vectors = try vs.VectorStore.init(self.allocator, live_count, self.config.dims, T);
+            errdefer new_vectors.deinit();
+
+            var new_tape = tape.GraphTape.init(self.allocator, .{ .m = self.config.m, .m_base = self.config.m_base });
+            errdefer new_tape.deinit();
+
+            var new_meta = if (has_metadata) std.ArrayListUnmanaged(MetaFixed){} else {};
+            if (has_metadata) {
+                try new_meta.ensureTotalCapacity(self.allocator, live_count);
+            }
+
+            // Copy nodes in new order
+            for (slots) |s| {
+                const old_i = s.old_slot;
+                const old_node = self.nodes.items[old_i];
+
+                // Copy vector
+                const old_vec = self.vectors.get(old_node.vector_slot);
+                const new_vslot = try new_vectors.add(old_vec);
+
+                // Allocate new graph tape for this node
+                const graph_bytes = new_tape.config.nodeGraphBytes(old_node.level);
+                const new_goff: u32 = @intCast(new_tape.data.items.len);
+                try new_tape.data.appendNTimes(self.allocator, 0, graph_bytes);
+
+                // Copy neighbor data from old tape
+                const old_off = old_node.graph_offset;
+                @memcpy(
+                    new_tape.data.items[new_goff..][0..graph_bytes],
+                    self.graph_tape.data.items[old_off..][0..graph_bytes],
+                );
+
+                new_nodes.appendAssumeCapacity(.{
+                    .graph_offset = new_goff,
+                    .vector_slot = new_vslot,
+                    .level = old_node.level,
+                    .deleted = false,
+                });
+
+                if (has_metadata) {
+                    new_meta.appendAssumeCapacity(self.metadata_store.items[old_i]);
+                }
+            }
+
+            // Remap all neighbor references and filter out deleted
+            for (new_nodes.items) |nn| {
+                for (0..@as(usize, nn.level) + 1) |lvl| {
+                    var nr = new_tape.getNeighbors(nn.graph_offset, lvl);
+                    const neighbor_count = nr.count();
+
+                    // Filter and remap neighbors
+                    var write_idx: usize = 0;
+                    var read_idx: usize = 0;
+                    while (read_idx < neighbor_count) : (read_idx += 1) {
+                        const old_id = nr.get(read_idx);
+                        if (old_id < old_to_new.len) {
+                            const mapped = old_to_new[old_id];
+                            if (mapped != std.math.maxInt(u32)) {
+                                nr.set(write_idx, mapped);
+                                write_idx += 1;
+                            }
+                        }
+                    }
+                    // Update count to reflect only valid neighbors
+                    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(nr.tape)), @intCast(write_idx), .little);
+                }
+            }
+
+            // Swap in new containers
+            self.nodes.deinit(self.allocator);
+            self.vectors.deinit();
+            self.graph_tape.deinit();
+            self.free_slots.clearRetainingCapacity();
+            if (has_metadata) {
+                self.metadata_store.deinit(self.allocator);
+                self.metadata_store = new_meta;
+            }
+
+            self.nodes = new_nodes;
+            self.vectors = new_vectors;
+            self.graph_tape = new_tape;
+
+            // Update entry point
+            if (self.entry_point) |ep| {
+                const mapped = old_to_new[ep];
+                self.entry_point = if (mapped == std.math.maxInt(u32)) self.findNewEntryPoint(0) else mapped;
+            }
+
+            // Recalculate max_level from surviving nodes
+            var new_max_level: u16 = 0;
+            for (self.nodes.items) |n| {
+                if (n.level > new_max_level) new_max_level = n.level;
+            }
+            self.max_level = new_max_level;
+        }
+
+        // =====================================================================
         // Persistence
         // =====================================================================
         const persist = @import("persistence_v2.zig");
