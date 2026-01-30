@@ -6,6 +6,19 @@ pub const StringTable = struct {
     pub fn slice(self: *const StringTable, off: u32, len: u32) []const u8 {
         return self.data[@as(usize, off)..][0..@as(usize, len)];
     }
+
+    /// Pre-allocate additional capacity for batch inserts.
+    /// This allows a single reallocation for an entire batch.
+    pub fn ensureAdditionalCapacity(self: *StringTable, allocator: std.mem.Allocator, add: usize) !void {
+        if (add == 0) return;
+        const old_len = self.data.len;
+        const new_len = old_len + add;
+        if (old_len == 0) {
+            self.data = try allocator.alloc(u8, new_len);
+        } else {
+            self.data = try allocator.realloc(self.data, new_len);
+        }
+    }
 };
 
 /// Generate extern struct from Metadata where []const u8 becomes off+len pairs.
@@ -148,4 +161,59 @@ pub fn decode(
         }
     }
     return meta;
+}
+
+/// Encode metadata into pre-allocated StringTable space, writing at cursor position.
+/// Use with totalStringBytesForBatch() and ensureAdditionalCapacity() for batch inserts.
+pub fn encodeInto(
+    comptime Metadata: type,
+    meta: Metadata,
+    st: *StringTable,
+    cursor: *usize,
+) FixedOf(Metadata) {
+    if (Metadata == void) return .{};
+
+    var fixed: FixedOf(Metadata) = undefined;
+    const info = @typeInfo(Metadata).@"struct";
+
+    inline for (info.fields) |f| {
+        switch (@typeInfo(f.type)) {
+            .pointer => {
+                const s = @field(meta, f.name);
+                const off: u32 = @intCast(cursor.*);
+                const len: u32 = @intCast(s.len);
+                @memcpy(st.data[cursor.*..][0..s.len], s);
+                cursor.* += s.len;
+                @field(fixed, f.name ++ "_off") = off;
+                @field(fixed, f.name ++ "_len") = len;
+            },
+            .int, .float, .bool, .@"enum" => {
+                @field(fixed, f.name) = @field(meta, f.name);
+            },
+            else => unreachable,
+        }
+    }
+    return fixed;
+}
+
+/// Calculate total string bytes needed for a batch of metadata records.
+/// Used for pre-allocating StringTable space before batch insert.
+pub fn totalStringBytesForBatch(comptime Metadata: type, metas: []const Metadata) usize {
+    if (Metadata == void) return 0;
+
+    var total: usize = 0;
+    const info = @typeInfo(Metadata).@"struct";
+    for (metas) |m| {
+        inline for (info.fields) |f| {
+            switch (@typeInfo(f.type)) {
+                .pointer => |p| {
+                    if (p.size == .slice and p.child == u8) {
+                        total += @field(m, f.name).len;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return total;
 }

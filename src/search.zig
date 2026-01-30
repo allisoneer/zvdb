@@ -75,7 +75,10 @@ pub fn topK(
 
     try candidates.add(.{ .id = ep, .distance = ep_dist });
     try visited.put(ep, {});
-    try results.add(.{ .id = ep, .distance = ep_dist });
+    // Only add to results if not deleted
+    if (!ep_node.deleted) {
+        try results.add(.{ .id = ep, .distance = ep_dist });
+    }
 
     while (candidates.count() > 0) {
         const c = candidates.remove();
@@ -92,11 +95,17 @@ pub fn topK(
 
                 const nb_node = nodes.get(nb) orelse continue;
                 const d = dist(query, nb_node.point);
-                if (results.count() < ef_search or d < results.peek().?.distance) {
-                    try candidates.add(.{ .id = nb, .distance = d });
-                    try results.add(.{ .id = nb, .distance = d });
-                    if (results.count() > ef_search) {
-                        _ = results.remove();
+
+                // Always add to candidates for traversal (even deleted nodes)
+                try candidates.add(.{ .id = nb, .distance = d });
+
+                // Only add to results if not deleted
+                if (!nb_node.deleted) {
+                    if (results.count() < ef_search or d < results.peek().?.distance) {
+                        try results.add(.{ .id = nb, .distance = d });
+                        if (results.count() > ef_search) {
+                            _ = results.remove();
+                        }
                     }
                 }
             }
@@ -192,8 +201,8 @@ pub fn topKFiltered(
     try candidates.add(.{ .id = ep, .distance = ep_dist });
     try visited.put(ep, {});
 
-    // Only add to results if passes filter
-    if (pred(ctx, ep_node.meta_fixed)) {
+    // Only add to results if not deleted and passes filter
+    if (!ep_node.deleted and pred(ctx, ep_node.meta_fixed)) {
         try results.add(.{ .id = ep, .distance = ep_dist });
     }
 
@@ -214,11 +223,11 @@ pub fn topKFiltered(
                 const nb_node = nodes.get(nb) orelse continue;
                 const d = dist(query, nb_node.point);
 
-                // Always add to candidates for traversal
+                // Always add to candidates for traversal (even deleted nodes)
                 try candidates.add(.{ .id = nb, .distance = d });
 
-                // Only add to results if passes filter
-                if (pred(ctx, nb_node.meta_fixed)) {
+                // Only add to results if not deleted and passes filter
+                if (!nb_node.deleted and pred(ctx, nb_node.meta_fixed)) {
                     if (results.count() < ef_search or d < results.peek().?.distance) {
                         try results.add(.{ .id = nb, .distance = d });
                         if (results.count() > ef_search) {

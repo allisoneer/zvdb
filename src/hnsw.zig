@@ -17,12 +17,19 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         pub const MetaFixed = metadata.FixedOf(Metadata);
         const dist = distance.distanceFn(T, metric);
 
+        pub const Error = error{
+            NodeNotFound,
+            NodeDeleted,
+            DimMismatch,
+        };
+
         pub const Node = struct {
             id: usize,
             point: []T,
             meta_fixed: MetaFixed,
             connections: []ArrayList(usize),
             mutex: Mutex,
+            deleted: bool = false,
 
             pub fn init(allocator: Allocator, id: usize, point: []const T, level: usize, mf: MetaFixed) !Node {
                 const conns = try allocator.alloc(ArrayList(usize), level + 1);
@@ -136,6 +143,248 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
             }
 
             return id;
+        }
+
+        /// Batch insert multiple points with their metadata.
+        /// Uses single lock and pre-allocated StringTable for efficiency.
+        /// Returns slice of inserted IDs (caller owns).
+        pub fn insertBatch(self: *Self, points: []const []const T, metas: []const Metadata) ![]usize {
+            std.debug.assert(points.len == metas.len);
+            if (points.len == 0) return &[_]usize{};
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Validate all dimensions
+            for (points) |p| std.debug.assert(p.len == self.dims);
+
+            const base_id = self.nodes.count();
+            const n = points.len;
+
+            // Pre-compute random levels
+            const levels = try self.allocator.alloc(usize, n);
+            defer self.allocator.free(levels);
+            var max_level_new: usize = self.max_level;
+            for (levels) |*lvl| {
+                lvl.* = self.randomLevel();
+                if (lvl.* > max_level_new) max_level_new = lvl.*;
+            }
+
+            // Pre-grow StringTable once for all metadata
+            const add_bytes = metadata.totalStringBytesForBatch(Metadata, metas);
+            const old_len = self.string_table.data.len;
+            try self.string_table.ensureAdditionalCapacity(self.allocator, add_bytes);
+            var cursor: usize = old_len;
+
+            // Encode all metadata
+            var fixeds = try self.allocator.alloc(MetaFixed, n);
+            defer self.allocator.free(fixeds);
+            for (metas, 0..) |m, idx| {
+                fixeds[idx] = metadata.encodeInto(Metadata, m, &self.string_table, &cursor);
+            }
+
+            // Allocate result IDs
+            var ids = try self.allocator.alloc(usize, n);
+            errdefer self.allocator.free(ids);
+
+            // Insert nodes sequentially, connecting to graph
+            for (points, 0..) |p, idx| {
+                const id = base_id + idx;
+                const level = levels[idx];
+                var node = try Node.init(self.allocator, id, p, level, fixeds[idx]);
+                errdefer node.deinit(self.allocator);
+                try self.nodes.put(id, node);
+                ids[idx] = id;
+
+                // Connect using same algorithm as single insert
+                if (self.entry_point) |entry| {
+                    var ep_copy = entry;
+                    var curr_dist = dist(node.point, self.nodes.get(ep_copy).?.point);
+
+                    for (0..self.max_level + 1) |layer| {
+                        var changed = true;
+                        while (changed) {
+                            changed = false;
+                            const curr_node = self.nodes.get(ep_copy).?;
+                            if (layer < curr_node.connections.len) {
+                                for (curr_node.connections[layer].items) |neighbor_id| {
+                                    const neighbor = self.nodes.get(neighbor_id).?;
+                                    const d = dist(node.point, neighbor.point);
+                                    if (d < curr_dist) {
+                                        ep_copy = neighbor_id;
+                                        curr_dist = d;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (layer <= level) {
+                            try self.connect(id, ep_copy, @intCast(layer));
+                        }
+                    }
+
+                    // Update max_level as we go to help subsequent inserts
+                    if (level > self.max_level) self.max_level = level;
+                } else {
+                    self.entry_point = id;
+                }
+            }
+
+            if (max_level_new > self.max_level) self.max_level = max_level_new;
+            return ids;
+        }
+
+        /// Soft delete a node by marking it as deleted (tombstone).
+        /// Search will still traverse through deleted nodes' neighbors but exclude them from results.
+        /// If the entry point is deleted, it will be updated to a non-deleted neighbor if possible.
+        pub fn delete(self: *Self, id: usize) Error!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const node = self.nodes.getPtr(id) orelse return Error.NodeNotFound;
+            if (node.deleted) return Error.NodeDeleted;
+            node.deleted = true;
+
+            // If we deleted the entry point, try to find a new one
+            if (self.entry_point == id) {
+                self.entry_point = self.findNewEntryPoint(id);
+            }
+        }
+
+        /// Find a new entry point after the current one is deleted.
+        /// Looks for a non-deleted neighbor, or any non-deleted node.
+        fn findNewEntryPoint(self: *Self, deleted_id: usize) ?usize {
+            // First try neighbors of the deleted node
+            if (self.nodes.get(deleted_id)) |deleted_node| {
+                for (deleted_node.connections) |level_conns| {
+                    for (level_conns.items) |neighbor_id| {
+                        if (self.nodes.get(neighbor_id)) |neighbor| {
+                            if (!neighbor.deleted) return neighbor_id;
+                        }
+                    }
+                }
+            }
+
+            // If no neighbor found, find any non-deleted node
+            var it = self.nodes.iterator();
+            while (it.next()) |kv| {
+                if (!kv.value_ptr.deleted) return kv.key_ptr.*;
+            }
+
+            return null;
+        }
+
+        /// Update by replacement: deletes old node and inserts new one with new ID.
+        /// Returns the new ID.
+        pub fn updateReplace(self: *Self, id: usize, point: []const T, meta: Metadata) !usize {
+            try self.delete(id);
+            return self.insert(point, meta);
+        }
+
+        /// Update in place: preserves ID, updates vector and metadata.
+        /// Returns error if node is deleted or not found.
+        pub fn updateInPlace(self: *Self, id: usize, point: []const T, meta: Metadata) !void {
+            std.debug.assert(point.len == self.dims);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const node = self.nodes.getPtr(id) orelse return Error.NodeNotFound;
+            if (node.deleted) return Error.NodeDeleted;
+            if (node.point.len != point.len) return Error.DimMismatch;
+
+            @memcpy(node.point, point);
+            const mf = try metadata.encode(Metadata, meta, &self.string_table, self.allocator);
+            node.meta_fixed = mf;
+        }
+
+        /// Compact the index by removing deleted nodes and rebuilding contiguous IDs.
+        /// Remaps all connections to new IDs. Updates entry point.
+        pub fn compact(self: *Self) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            try self.compactLocked();
+        }
+
+        fn compactLocked(self: *Self) !void {
+            const old_count = self.nodes.count();
+            if (old_count == 0) return;
+
+            // Build old->new ID map for non-deleted nodes
+            var id_map = AutoHashMap(usize, usize).init(self.allocator);
+            defer id_map.deinit();
+
+            var live_count: usize = 0;
+            var it = self.nodes.iterator();
+            while (it.next()) |kv| {
+                if (!kv.value_ptr.deleted) {
+                    try id_map.put(kv.key_ptr.*, live_count);
+                    live_count += 1;
+                }
+            }
+
+            if (live_count == old_count) return; // Nothing to compact
+
+            // Rebuild nodes map with new IDs
+            var new_nodes = AutoHashMap(usize, Node).init(self.allocator);
+            errdefer new_nodes.deinit();
+
+            var it2 = self.nodes.iterator();
+            while (it2.next()) |kv| {
+                const old_id = kv.key_ptr.*;
+                var n = kv.value_ptr.*;
+
+                if (n.deleted) {
+                    n.deinit(self.allocator);
+                    continue;
+                }
+
+                const new_id = id_map.get(old_id).?;
+
+                // Remap connections to new IDs
+                for (n.connections) |*level_list| {
+                    var write_idx: usize = 0;
+                    for (level_list.items) |nb_old| {
+                        if (id_map.get(nb_old)) |nb_new| {
+                            level_list.items[write_idx] = nb_new;
+                            write_idx += 1;
+                        }
+                    }
+                    level_list.shrinkRetainingCapacity(write_idx);
+                }
+
+                n.id = new_id;
+                n.deleted = false;
+                try new_nodes.put(new_id, n);
+            }
+
+            // Swap maps
+            self.nodes.deinit();
+            self.nodes = new_nodes;
+
+            // Update entry point
+            if (self.entry_point) |old_ep| {
+                self.entry_point = id_map.get(old_ep);
+            }
+
+            // Recompute max_level
+            var max_lvl: usize = 0;
+            var it3 = self.nodes.iterator();
+            while (it3.next()) |kv| {
+                const lvl = if (kv.value_ptr.connections.len > 0) kv.value_ptr.connections.len - 1 else 0;
+                if (lvl > max_lvl) max_lvl = lvl;
+            }
+            self.max_level = max_lvl;
+        }
+
+        /// Returns the count of non-deleted nodes.
+        pub fn liveCount(self: *const Self) usize {
+            var live: usize = 0;
+            var it = self.nodes.iterator();
+            while (it.next()) |kv| {
+                if (!kv.value_ptr.deleted) live += 1;
+            }
+            return live;
         }
 
         fn connect(self: *Self, source: usize, target: usize, level: usize) !void {
@@ -266,10 +515,14 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
             return self.nodes.count();
         }
 
-        /// Save the entire index to a file
+        /// Save the entire index to a file.
+        /// Always compacts first to ensure clean contiguous IDs.
         pub fn save(self: *Self, path: []const u8) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
+
+            // Always compact before save to produce clean file
+            try self.compactLocked();
 
             const node_count = self.nodes.count();
 

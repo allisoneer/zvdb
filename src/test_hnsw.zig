@@ -70,6 +70,136 @@ test "distance metrics - dot product" {
 }
 
 // =============================================================================
+// SIMD Distance Equivalence Tests
+// =============================================================================
+
+fn scalarSquaredEuclidean(comptime T: type) fn ([]const T, []const T) T {
+    return struct {
+        fn f(a: []const T, b: []const T) T {
+            var sum: T = 0;
+            for (a, b) |av, bv| {
+                const d = av - bv;
+                sum += d * d;
+            }
+            return sum;
+        }
+    }.f;
+}
+
+fn scalarDot(comptime T: type) fn ([]const T, []const T) T {
+    return struct {
+        fn f(a: []const T, b: []const T) T {
+            var sum: T = 0;
+            for (a, b) |av, bv| sum += av * bv;
+            return sum;
+        }
+    }.f;
+}
+
+fn scalarCosine(comptime T: type) fn ([]const T, []const T) T {
+    return struct {
+        fn f(a: []const T, b: []const T) T {
+            var dot: T = 0;
+            var na: T = 0;
+            var nb: T = 0;
+            for (a, b) |av, bv| {
+                dot += av * bv;
+                na += av * av;
+                nb += bv * bv;
+            }
+            if (na == 0 or nb == 0) return 1;
+            return 1 - (dot / (std.math.sqrt(na) * std.math.sqrt(nb)));
+        }
+    }.f;
+}
+
+test "SIMD distance - squared euclidean f32 various dims" {
+    const allocator = testing.allocator;
+    const dims = [_]usize{ 1, 4, 8, 16, 100, 128, 768 };
+    const simd_fn = zvdb.distance.distanceFn(f32, .squared_euclidean);
+    const scalar_fn = scalarSquaredEuclidean(f32);
+
+    for (dims) |dim| {
+        const a = try allocator.alloc(f32, dim);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, dim);
+        defer allocator.free(b);
+
+        for (a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.1;
+        for (b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.2 + 0.5;
+
+        const simd_result = simd_fn(a, b);
+        const scalar_result = scalar_fn(a, b);
+        // Use relative tolerance for larger results
+        const relative_error = @abs(simd_result - scalar_result) / @max(scalar_result, 1.0);
+        try testing.expect(relative_error < 1e-5);
+    }
+}
+
+test "SIMD distance - squared euclidean f64 various dims" {
+    const allocator = testing.allocator;
+    const dims = [_]usize{ 1, 4, 8, 16, 100, 128 };
+    const simd_fn = zvdb.distance.distanceFn(f64, .squared_euclidean);
+    const scalar_fn = scalarSquaredEuclidean(f64);
+
+    for (dims) |dim| {
+        const a = try allocator.alloc(f64, dim);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f64, dim);
+        defer allocator.free(b);
+
+        for (a, 0..) |*v, i| v.* = @as(f64, @floatFromInt(i)) * 0.1;
+        for (b, 0..) |*v, i| v.* = @as(f64, @floatFromInt(i)) * 0.2 + 0.5;
+
+        const simd_result = simd_fn(a, b);
+        const scalar_result = scalar_fn(a, b);
+        try testing.expectApproxEqAbs(scalar_result, simd_result, 1e-10);
+    }
+}
+
+test "SIMD distance - cosine f32 various dims" {
+    const allocator = testing.allocator;
+    const dims = [_]usize{ 4, 8, 16, 100, 128 };
+    const simd_fn = zvdb.distance.distanceFn(f32, .cosine);
+    const scalar_fn = scalarCosine(f32);
+
+    for (dims) |dim| {
+        const a = try allocator.alloc(f32, dim);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, dim);
+        defer allocator.free(b);
+
+        for (a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) * 0.1;
+        for (b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) * 0.2;
+
+        const simd_result = simd_fn(a, b);
+        const scalar_result = scalar_fn(a, b);
+        try testing.expectApproxEqAbs(scalar_result, simd_result, 1e-5);
+    }
+}
+
+test "SIMD distance - dot product f32 various dims" {
+    const allocator = testing.allocator;
+    const dims = [_]usize{ 1, 4, 8, 16, 100, 128 };
+    const simd_fn = zvdb.distance.distanceFn(f32, .dot_product);
+    const scalar_fn = scalarDot(f32);
+
+    for (dims) |dim| {
+        const a = try allocator.alloc(f32, dim);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, dim);
+        defer allocator.free(b);
+
+        for (a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1));
+        for (b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) * 2;
+
+        const simd_result = simd_fn(a, b);
+        const scalar_result = -scalar_fn(a, b); // dot_product returns negative
+        try testing.expectApproxEqAbs(scalar_result, simd_result, 1e-3);
+    }
+}
+
+// =============================================================================
 // Metadata Tests
 // =============================================================================
 
@@ -222,6 +352,381 @@ test "HNSW - Edge Cases" {
     defer allocator.free(large_k_results);
 
     try testing.expectEqual(@as(usize, 2), large_k_results.len);
+}
+
+// =============================================================================
+// Batch Insert Tests
+// =============================================================================
+
+test "HNSW insertBatch basic" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, TestMeta).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const points = [_][]const f32{
+        &[_]f32{ 1, 2, 3 },
+        &[_]f32{ 4, 5, 6 },
+        &[_]f32{ 7, 8, 9 },
+    };
+    const metas = [_]TestMeta{
+        .{ .path = "a.zig", .line_start = 1, .line_end = 10 },
+        .{ .path = "b.zig", .line_start = 20, .line_end = 30 },
+        .{ .path = "c.zig", .line_start = 40, .line_end = 50 },
+    };
+
+    const ids = try hnsw.insertBatch(&points, &metas);
+    defer allocator.free(ids);
+
+    // Verify IDs are 0, 1, 2
+    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqual(@as(usize, 0), ids[0]);
+    try testing.expectEqual(@as(usize, 1), ids[1]);
+    try testing.expectEqual(@as(usize, 2), ids[2]);
+
+    // Verify count
+    try testing.expectEqual(@as(usize, 3), hnsw.count());
+
+    // Verify search finds all vectors
+    const results = try hnsw.searchTopK(&[_]f32{ 1, 2, 3 }, 3, 50);
+    defer allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expectEqual(@as(usize, 0), results[0].id); // Exact match first
+}
+
+test "HNSW insertBatch empty" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const empty_points: []const []const f32 = &.{};
+    const empty_metas: []const void = &.{};
+
+    const ids = try hnsw.insertBatch(empty_points, empty_metas);
+    // Empty batch returns empty slice (not allocated)
+    try testing.expectEqual(@as(usize, 0), ids.len);
+    try testing.expectEqual(@as(usize, 0), hnsw.count());
+}
+
+test "HNSW insertBatch large" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 64, 16, 200);
+    defer hnsw.deinit();
+
+    const n = 1000;
+    var points_list: [n][]f32 = undefined;
+    var metas_list: [n]void = undefined;
+
+    // Allocate and initialize points
+    for (&points_list, 0..) |*p, i| {
+        p.* = try allocator.alloc(f32, 64);
+        for (p.*) |*v| v.* = @as(f32, @floatFromInt(i)) * 0.001 + std.crypto.random.float(f32);
+        metas_list[i] = {};
+    }
+    defer for (&points_list) |p| allocator.free(p);
+
+    // Cast to const slice
+    var const_points: [n][]const f32 = undefined;
+    for (&points_list, 0..) |p, i| const_points[i] = p;
+
+    const ids = try hnsw.insertBatch(&const_points, &metas_list);
+    defer allocator.free(ids);
+
+    // Verify count
+    try testing.expectEqual(@as(usize, n), ids.len);
+    try testing.expectEqual(@as(usize, n), hnsw.count());
+
+    // Search and verify results are sorted
+    const results = try hnsw.searchTopK(points_list[0], 10, 100);
+    defer allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 10), results.len);
+
+    // Results should be sorted by distance
+    var last_dist: f32 = 0;
+    for (results) |r| {
+        try testing.expect(r.distance >= last_dist);
+        last_dist = r.distance;
+    }
+}
+
+test "HNSW insertBatch with void metadata" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .cosine, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const points = [_][]const f32{
+        &[_]f32{ 1, 0, 0 },
+        &[_]f32{ 0, 1, 0 },
+        &[_]f32{ 0, 0, 1 },
+    };
+    const metas = [_]void{ {}, {}, {} };
+
+    const ids = try hnsw.insertBatch(&points, &metas);
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqual(@as(usize, 3), hnsw.count());
+}
+
+test "HNSW insertBatch metadata preserved" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, TestMeta).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const points = [_][]const f32{
+        &[_]f32{ 1, 2, 3 },
+        &[_]f32{ 4, 5, 6 },
+    };
+    const metas = [_]TestMeta{
+        .{ .path = "first/path.zig", .line_start = 100, .line_end = 200 },
+        .{ .path = "second/path.zig", .line_start = 300, .line_end = 400 },
+    };
+
+    const ids = try hnsw.insertBatch(&points, &metas);
+    defer allocator.free(ids);
+
+    // Verify metadata is correctly preserved
+    const meta0 = hnsw.getMetadata(0).?;
+    try testing.expectEqualStrings("first/path.zig", meta0.path);
+    try testing.expectEqual(@as(u32, 100), meta0.line_start);
+    try testing.expectEqual(@as(u32, 200), meta0.line_end);
+
+    const meta1 = hnsw.getMetadata(1).?;
+    try testing.expectEqualStrings("second/path.zig", meta1.path);
+    try testing.expectEqual(@as(u32, 300), meta1.line_start);
+    try testing.expectEqual(@as(u32, 400), meta1.line_end);
+}
+
+// =============================================================================
+// Mutation Tests (delete, update, compact)
+// =============================================================================
+
+test "HNSW delete and search skips deleted" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    // Insert two nodes
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, {});
+    _ = try hnsw.insert(&[_]f32{ 0, 1, 0 }, {});
+
+    try testing.expectEqual(@as(usize, 2), hnsw.count());
+    try testing.expectEqual(@as(usize, 2), hnsw.liveCount());
+
+    // Delete first node
+    try hnsw.delete(0);
+
+    // Count unchanged (tombstoned), but liveCount decreased
+    try testing.expectEqual(@as(usize, 2), hnsw.count());
+    try testing.expectEqual(@as(usize, 1), hnsw.liveCount());
+
+    // Search should only find second node
+    const results = try hnsw.searchTopK(&[_]f32{ 0, 1, 0 }, 2, 50);
+    defer allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(usize, 1), results[0].id);
+}
+
+test "HNSW delete already deleted returns error" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, {});
+    try hnsw.delete(0);
+
+    // Try to delete again - should error
+    const result = hnsw.delete(0);
+    try testing.expectError(HNSW(f32, .squared_euclidean, void).Error.NodeDeleted, result);
+}
+
+test "HNSW delete non-existent returns error" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const result = hnsw.delete(999);
+    try testing.expectError(HNSW(f32, .squared_euclidean, void).Error.NodeNotFound, result);
+}
+
+test "HNSW updateReplace returns new ID" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, TestMeta).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    const id0 = try hnsw.insert(&[_]f32{ 1, 0, 0 }, .{ .path = "old.zig", .line_start = 1, .line_end = 10 });
+    try testing.expectEqual(@as(usize, 0), id0);
+
+    // Update replace - should get new ID
+    const id1 = try hnsw.updateReplace(0, &[_]f32{ 0, 1, 0 }, .{ .path = "new.zig", .line_start = 20, .line_end = 30 });
+    try testing.expectEqual(@as(usize, 1), id1);
+
+    // Old ID should be deleted
+    try testing.expectEqual(@as(usize, 1), hnsw.liveCount());
+
+    // Search should find new node
+    const results = try hnsw.searchTopK(&[_]f32{ 0, 1, 0 }, 1, 50);
+    defer allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(usize, 1), results[0].id);
+
+    // New metadata preserved
+    const meta = hnsw.getMetadata(1).?;
+    try testing.expectEqualStrings("new.zig", meta.path);
+}
+
+test "HNSW updateInPlace preserves ID" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, TestMeta).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, .{ .path = "old.zig", .line_start = 1, .line_end = 10 });
+
+    // Update in place - same ID
+    try hnsw.updateInPlace(0, &[_]f32{ 0, 1, 0 }, .{ .path = "updated.zig", .line_start = 100, .line_end = 200 });
+
+    // Count unchanged
+    try testing.expectEqual(@as(usize, 1), hnsw.count());
+    try testing.expectEqual(@as(usize, 1), hnsw.liveCount());
+
+    // New data in place
+    const meta = hnsw.getMetadata(0).?;
+    try testing.expectEqualStrings("updated.zig", meta.path);
+    try testing.expectEqual(@as(u32, 100), meta.line_start);
+}
+
+test "HNSW updateInPlace on deleted returns error" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, {});
+    try hnsw.delete(0);
+
+    // Try updateInPlace on deleted node
+    const result = hnsw.updateInPlace(0, &[_]f32{ 0, 1, 0 }, {});
+    try testing.expectError(HNSW(f32, .squared_euclidean, void).Error.NodeDeleted, result);
+}
+
+test "HNSW compact remaps IDs" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    // Insert 3 nodes
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, {});
+    _ = try hnsw.insert(&[_]f32{ 0, 1, 0 }, {});
+    _ = try hnsw.insert(&[_]f32{ 0, 0, 1 }, {});
+
+    // Delete middle node
+    try hnsw.delete(1);
+
+    try testing.expectEqual(@as(usize, 3), hnsw.count());
+    try testing.expectEqual(@as(usize, 2), hnsw.liveCount());
+
+    // Compact
+    try hnsw.compact();
+
+    // Now should have 2 nodes with IDs 0 and 1
+    try testing.expectEqual(@as(usize, 2), hnsw.count());
+    try testing.expectEqual(@as(usize, 2), hnsw.liveCount());
+
+    // Search should work correctly
+    const results = try hnsw.searchTopK(&[_]f32{ 1, 0, 0 }, 2, 50);
+    defer allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "HNSW compact with no deletions is no-op" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, {});
+    _ = try hnsw.insert(&[_]f32{ 0, 1, 0 }, {});
+
+    const count_before = hnsw.count();
+    try hnsw.compact();
+    const count_after = hnsw.count();
+
+    try testing.expectEqual(count_before, count_after);
+}
+
+test "HNSW save after delete compacts automatically" {
+    const allocator = testing.allocator;
+    const HNSWType = HNSW(f32, .squared_euclidean, TestMeta);
+
+    var hnsw = HNSWType.init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, .{ .path = "a.zig", .line_start = 1, .line_end = 10 });
+    _ = try hnsw.insert(&[_]f32{ 0, 1, 0 }, .{ .path = "b.zig", .line_start = 20, .line_end = 30 });
+    _ = try hnsw.insert(&[_]f32{ 0, 0, 1 }, .{ .path = "c.zig", .line_start = 40, .line_end = 50 });
+
+    // Delete middle node
+    try hnsw.delete(1);
+
+    // Save - should compact automatically
+    const path = "test_delete_roundtrip.zvdb";
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try hnsw.save(path);
+
+    // Load and verify compacted
+    var loaded = try HNSWType.load(allocator, path);
+    defer loaded.deinit();
+
+    // Should have 2 nodes (compacted)
+    try testing.expectEqual(@as(usize, 2), loaded.count());
+
+    // Search works
+    const results = try loaded.searchTopK(&[_]f32{ 1, 0, 0 }, 2, 50);
+    defer allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "HNSW filtered search skips deleted" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, TestMeta).init(allocator, 3, 16, 200);
+    defer hnsw.deinit();
+
+    // Insert some points with metadata
+    _ = try hnsw.insert(&[_]f32{ 1, 0, 0 }, .{ .path = "a.zig", .line_start = 1, .line_end = 10 });
+    _ = try hnsw.insert(&[_]f32{ 0, 1, 0 }, .{ .path = "b.zig", .line_start = 20, .line_end = 30 });
+    _ = try hnsw.insert(&[_]f32{ 0, 0, 1 }, .{ .path = "c.zig", .line_start = 40, .line_end = 50 });
+
+    // Delete one node
+    try hnsw.delete(1);
+
+    const MetaFixed = HNSW(f32, .squared_euclidean, TestMeta).MetaFixed;
+    const st = hnsw.getStringTable();
+
+    // Filter predicate: all .zig files
+    const FilterCtx = struct {
+        st: *const zvdb.metadata.StringTable,
+    };
+    const pred = struct {
+        fn f(ctx: FilterCtx, mf: MetaFixed) bool {
+            const path = ctx.st.slice(mf.path_off, mf.path_len);
+            return std.mem.endsWith(u8, path, ".zig");
+        }
+    }.f;
+
+    const results = try hnsw.searchFiltered(
+        &[_]f32{ 0, 0, 0 },
+        3,
+        50,
+        FilterCtx{ .st = st },
+        pred,
+    );
+    defer allocator.free(results);
+
+    // Should only return non-deleted nodes (0 and 2)
+    try testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |r| {
+        try testing.expect(r.id != 1); // Deleted node should not appear
+    }
 }
 
 test "HNSW - Memory Leaks" {
