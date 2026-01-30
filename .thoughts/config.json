@@ -19,7 +19,8 @@
     }
   ],
   "references": [
-    "https://codeberg.org/ziglang/zig.git"
+    "https://codeberg.org/ziglang/zig.git",
+    "https://github.com/unum-cloud/USearch.git",
+    "https://github.com/ashvardanian/simsimd.git"
   ]
 }
-

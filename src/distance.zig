@@ -88,19 +88,22 @@ fn dotProductNegative(comptime T: type) fn ([]const T, []const T) T {
 // =============================================================================
 
 /// SIMD squared Euclidean distance: sum((a-b)^2)
+/// Uses vector accumulator with FMA for reduced reduction overhead.
 fn simdSquaredEuclidean(comptime T: type, a: []const T, b: []const T) T {
-    const lanes = std.simd.suggestVectorLength(T) orelse 4;
+    const lanes = std.simd.suggestVectorLength(T) orelse 8;
     const Vec = @Vector(lanes, T);
+    var acc_v: Vec = @splat(0);
     const n = a.len / lanes;
+
     var i: usize = 0;
-    var acc: T = 0;
     while (i < n) : (i += 1) {
         const off = i * lanes;
         const va: Vec = a[off..][0..lanes].*;
         const vb: Vec = b[off..][0..lanes].*;
         const d = va - vb;
-        acc += @reduce(.Add, d * d);
+        acc_v = @mulAdd(Vec, d, d, acc_v); // FMA: acc += d*d
     }
+    var acc: T = @reduce(.Add, acc_v);
     // Scalar tail for remaining elements
     const start = n * lanes;
     for (a[start..], b[start..]) |av, bv| {
@@ -111,18 +114,21 @@ fn simdSquaredEuclidean(comptime T: type, a: []const T, b: []const T) T {
 }
 
 /// SIMD dot product: sum(a*b)
+/// Uses vector accumulator with FMA for reduced reduction overhead.
 fn simdDot(comptime T: type, a: []const T, b: []const T) T {
-    const lanes = std.simd.suggestVectorLength(T) orelse 4;
+    const lanes = std.simd.suggestVectorLength(T) orelse 8;
     const Vec = @Vector(lanes, T);
+    var acc_v: Vec = @splat(0);
     const n = a.len / lanes;
+
     var i: usize = 0;
-    var acc: T = 0;
     while (i < n) : (i += 1) {
         const off = i * lanes;
         const va: Vec = a[off..][0..lanes].*;
         const vb: Vec = b[off..][0..lanes].*;
-        acc += @reduce(.Add, va * vb);
+        acc_v = @mulAdd(Vec, va, vb, acc_v);
     }
+    var acc: T = @reduce(.Add, acc_v);
     // Scalar tail
     const start = n * lanes;
     for (a[start..], b[start..]) |av, bv| acc += av * bv;
@@ -130,22 +136,27 @@ fn simdDot(comptime T: type, a: []const T, b: []const T) T {
 }
 
 /// SIMD dot product and squared norms in one pass (for cosine distance)
+/// Uses three vector accumulators with FMA for reduced reduction overhead.
 fn simdDotNorms(comptime T: type, a: []const T, b: []const T, dot_out: *T, na_out: *T, nb_out: *T) void {
-    const lanes = std.simd.suggestVectorLength(T) orelse 4;
+    const lanes = std.simd.suggestVectorLength(T) orelse 8;
     const Vec = @Vector(lanes, T);
+    var dot_v: Vec = @splat(0);
+    var na_v: Vec = @splat(0);
+    var nb_v: Vec = @splat(0);
+
     const n = a.len / lanes;
     var i: usize = 0;
-    var dot: T = 0;
-    var na: T = 0;
-    var nb: T = 0;
     while (i < n) : (i += 1) {
         const off = i * lanes;
         const va: Vec = a[off..][0..lanes].*;
         const vb: Vec = b[off..][0..lanes].*;
-        dot += @reduce(.Add, va * vb);
-        na += @reduce(.Add, va * va);
-        nb += @reduce(.Add, vb * vb);
+        dot_v = @mulAdd(Vec, va, vb, dot_v);
+        na_v = @mulAdd(Vec, va, va, na_v);
+        nb_v = @mulAdd(Vec, vb, vb, nb_v);
     }
+    var dot: T = @reduce(.Add, dot_v);
+    var na: T = @reduce(.Add, na_v);
+    var nb: T = @reduce(.Add, nb_v);
     // Scalar tail
     const start = n * lanes;
     for (a[start..], b[start..]) |av, bv| {
