@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
+const Order = std.math.Order;
 
 pub fn HNSW(comptime T: type) type {
     return struct {
@@ -9,17 +10,21 @@ pub fn HNSW(comptime T: type) type {
 
         const Node = struct {
             id: usize,
-            point: []const T,
+            point: []T,
             connections: []ArrayList(usize),
 
             fn init(allocator: Allocator, id: usize, point: []const T, level: usize) !Node {
-                var connections = try allocator.alloc(ArrayList(usize), level + 1);
+                const connections = try allocator.alloc(ArrayList(usize), level + 1);
+                errdefer allocator.free(connections);
                 for (connections) |*conn| {
                     conn.* = ArrayList(usize).init(allocator);
                 }
+                const owned_point = try allocator.alloc(T, point.len);
+                errdefer allocator.free(owned_point);
+                @memcpy(owned_point, point);
                 return Node{
                     .id = id,
-                    .point = point,
+                    .point = owned_point,
                     .connections = connections,
                 };
             }
@@ -29,6 +34,7 @@ pub fn HNSW(comptime T: type) type {
                     conn.deinit();
                 }
                 allocator.free(self.connections);
+                allocator.free(self.point);
             }
         };
 
@@ -51,8 +57,9 @@ pub fn HNSW(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.nodes.valueIterator();
-            while (it.next()) |node| {
+            var it = self.nodes.iterator();
+            while (it.next()) |entry| {
+                var node = entry.value_ptr;
                 node.deinit(self.allocator);
             }
             self.nodes.deinit();
@@ -62,27 +69,28 @@ pub fn HNSW(comptime T: type) type {
             const id = self.nodes.count();
             const level = self.randomLevel();
             var node = try Node.init(self.allocator, id, point, level);
+            errdefer node.deinit(self.allocator);
 
-            if (level > self.max_level) {
-                self.max_level = level;
-            }
+            try self.nodes.put(id, node);
 
             if (self.entry_point) |entry| {
                 var ep_copy = entry;
-                var curr_dist = distance(point, self.nodes.get(ep_copy).?.point);
+                var curr_dist = distance(node.point, self.nodes.get(ep_copy).?.point);
 
-                for (0..@min(self.max_level, level) + 1) |layer| {
+                for (0..self.max_level + 1) |layer| {
                     var changed = true;
                     while (changed) {
                         changed = false;
                         const curr_node = self.nodes.get(ep_copy).?;
-                        for (curr_node.connections[layer].items) |neighbor_id| {
-                            const neighbor = self.nodes.get(neighbor_id).?;
-                            const dist = distance(point, neighbor.point);
-                            if (dist < curr_dist) {
-                                ep_copy = neighbor_id;
-                                curr_dist = dist;
-                                changed = true;
+                        if (layer < curr_node.connections.len) {
+                            for (curr_node.connections[layer].items) |neighbor_id| {
+                                const neighbor = self.nodes.get(neighbor_id).?;
+                                const dist = distance(node.point, neighbor.point);
+                                if (dist < curr_dist) {
+                                    ep_copy = neighbor_id;
+                                    curr_dist = dist;
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -95,15 +103,28 @@ pub fn HNSW(comptime T: type) type {
                 self.entry_point = id;
             }
 
-            try self.nodes.put(id, node);
+            if (level > self.max_level) {
+                self.max_level = level;
+            }
         }
 
         fn connect(self: *Self, source: usize, target: usize, level: usize) !void {
-            try self.nodes.getPtr(source).?.connections[level].append(target);
-            try self.nodes.getPtr(target).?.connections[level].append(source);
+            var source_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
+            var target_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
 
-            try self.shrinkConnections(source, level);
-            try self.shrinkConnections(target, level);
+            if (level < source_node.connections.len) {
+                try source_node.connections[level].append(target);
+            }
+            if (level < target_node.connections.len) {
+                try target_node.connections[level].append(source);
+            }
+
+            if (level < source_node.connections.len) {
+                try self.shrinkConnections(source, level);
+            }
+            if (level < target_node.connections.len) {
+                try self.shrinkConnections(target, level);
+            }
         }
 
         fn shrinkConnections(self: *Self, node_id: usize, level: usize) !void {
@@ -136,14 +157,19 @@ pub fn HNSW(comptime T: type) type {
         }
 
         fn randomLevel(self: *Self) usize {
+            _ = self;
             var level: usize = 0;
-            while (level < 31 and std.crypto.random.float(f32) < 0.5) {
+            const max_level = 31;
+            while (level < max_level and std.crypto.random.float(f32) < 0.5) {
                 level += 1;
             }
             return level;
         }
 
         fn distance(a: []const T, b: []const T) T {
+            if (a.len != b.len) {
+                @panic("Mismatched dimensions in distance calculation");
+            }
             var sum: T = 0;
             for (a, 0..) |_, i| {
                 const diff = a[i] - b[i];
@@ -157,13 +183,7 @@ pub fn HNSW(comptime T: type) type {
             errdefer result.deinit();
 
             if (self.entry_point) |entry| {
-                const Context = struct {
-                    pub fn lessThan(_: void, a: CandidateNode, b: CandidateNode) bool {
-                        return a.distance > b.distance; // Max-heap for efficient pruning
-                    }
-                };
-
-                var candidates = std.PriorityQueue(CandidateNode, void, Context.lessThan).init(self.allocator, {});
+                var candidates = std.PriorityQueue(CandidateNode, void, CandidateNode.lessThan).init(self.allocator, {});
                 defer candidates.deinit();
 
                 var visited = std.AutoHashMap(usize, void).init(self.allocator);
@@ -188,12 +208,24 @@ pub fn HNSW(comptime T: type) type {
                 }
             }
 
+            const Context = struct {
+                query: []const T,
+                pub fn lessThan(ctx: @This(), a: Node, b: Node) bool {
+                    return distance(ctx.query, a.point) < distance(ctx.query, b.point);
+                }
+            };
+            std.sort.insertion(Node, result.items, Context{ .query = query }, Context.lessThan);
+
             return result.toOwnedSlice();
         }
 
         const CandidateNode = struct {
             id: usize,
             distance: T,
+
+            fn lessThan(_: void, a: CandidateNode, b: CandidateNode) std.math.Order {
+                return std.math.order(a.distance, b.distance);
+            }
         };
     };
 }
