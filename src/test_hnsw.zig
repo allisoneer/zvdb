@@ -3,7 +3,7 @@ const testing = std.testing;
 const HNSW = @import("hnsw.zig").HNSW;
 
 // Helper function to create a random point
-fn randomPoint(allocator: std.mem.Allocator, comptime dim: usize) ![]f32 {
+fn randomPoint(allocator: std.mem.Allocator, dim: usize) ![]f32 {
     const point = try allocator.alloc(f32, dim);
     for (point) |*v| {
         v.* = std.crypto.random.float(f32);
@@ -234,4 +234,211 @@ test "HNSW - Stress Test" {
 
         try testing.expectEqual(@as(usize, 10), results.len);
     }
+}
+
+test "HNSW - Different Data Types" {
+    const allocator = testing.allocator;
+
+    // Test with integer type
+    {
+        var hnsw_int = HNSW(i32).init(allocator, 16, 200);
+        defer hnsw_int.deinit();
+
+        try hnsw_int.insert(&[_]i32{ 1, 2, 3 });
+        try hnsw_int.insert(&[_]i32{ 4, 5, 6 });
+        try hnsw_int.insert(&[_]i32{ 7, 8, 9 });
+
+        const query_int = &[_]i32{ 3, 4, 5 };
+        const results_int = try hnsw_int.search(query_int, 2);
+        defer allocator.free(results_int);
+
+        try testing.expectEqual(@as(usize, 2), results_int.len);
+    }
+
+    // Test with float64 type
+    {
+        var hnsw_f64 = HNSW(f64).init(allocator, 16, 200);
+        defer hnsw_f64.deinit();
+
+        try hnsw_f64.insert(&[_]f64{ 1.1, 2.2, 3.3 });
+        try hnsw_f64.insert(&[_]f64{ 4.4, 5.5, 6.6 });
+        try hnsw_f64.insert(&[_]f64{ 7.7, 8.8, 9.9 });
+
+        const query_f64 = &[_]f64{ 3.3, 4.4, 5.5 };
+        const results_f64 = try hnsw_f64.search(query_f64, 2);
+        defer allocator.free(results_f64);
+
+        try testing.expectEqual(@as(usize, 2), results_f64.len);
+    }
+}
+
+test "HNSW - Consistency" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    defer hnsw.deinit();
+
+    const num_points = 10000;
+    const dim = 128;
+
+    // Insert points
+    for (0..num_points) |_| {
+        const point = try randomPoint(allocator, dim);
+        defer allocator.free(point);
+        try hnsw.insert(point);
+    }
+
+    // Perform multiple searches with the same query
+    const query = try randomPoint(allocator, dim);
+    defer allocator.free(query);
+
+    const num_searches = 10;
+    const k = 10;
+    var first_result = try allocator.alloc(f32, k * dim);
+    defer allocator.free(first_result);
+
+    for (0..num_searches) |i| {
+        const results = try hnsw.search(query, k);
+        defer allocator.free(results);
+
+        if (i == 0) {
+            // Store the first result for comparison
+            for (results, 0..) |result, j| {
+                @memcpy(first_result[j * dim .. (j + 1) * dim], result.point);
+            }
+        } else {
+            // Compare with the first result
+            for (results, 0..) |result, j| {
+                const start = j * dim;
+                const end = (j + 1) * dim;
+                try testing.expectEqualSlices(f32, first_result[start..end], result.point);
+            }
+        }
+    }
+}
+
+// TODO: Implement deletion
+// test "HNSW - Deletion" {
+//     const allocator = testing.allocator;
+//     var hnsw = HNSW(f32).init(allocator, 16, 200);
+//     defer hnsw.deinit();
+
+//     const num_points = 10;
+//     const dim = 3;
+
+//     // Insert points
+//     var points = try allocator.alloc([]f32, num_points);
+//     defer {
+//         for (points) |p| allocator.free(p);
+//         allocator.free(points);
+//     }
+
+//     for (0..num_points) |i| {
+//         points[i] = try randomPoint(allocator, dim);
+//         try hnsw.insert(points[i]);
+//         std.debug.print("Inserted point {d}\n", .{i});
+//     }
+
+//     // Delete every other point
+//     for (0..num_points, 0..) |i, id| {
+//         if (i % 2 == 0) {
+//             try hnsw.delete(id);
+//             std.debug.print("Deleted point {d}\n", .{id});
+//         }
+//     }
+
+//     // Verify that deleted points are not in search results
+//     const query = try randomPoint(allocator, dim);
+//     defer allocator.free(query);
+
+//     const results = try hnsw.search(query, num_points);
+//     defer allocator.free(results);
+
+//     std.debug.print("Search results:\n", .{});
+//     for (results) |result| {
+//         std.debug.print("Result ID: {d}\n", .{result.id});
+//         try testing.expect(result.id % 2 != 0);
+//     }
+
+//     // Verify that non-deleted points are still searchable
+//     for (1..num_points, 1..) |i, id| {
+//         if (i % 2 != 0) {
+//             std.debug.print("Searching for point {d}\n", .{id});
+//             const point_results = try hnsw.search(points[i], 1);
+//             defer allocator.free(point_results);
+//             if (point_results.len > 0) {
+//                 std.debug.print("Found result: {d}\n", .{point_results[0].id});
+//                 try testing.expectEqual(id, point_results[0].id);
+//             } else {
+//                 std.debug.print("No results found for point {d}\n", .{id});
+//             }
+//         }
+//     }
+// }
+
+test "HNSW - Performance Benchmarks" {
+    const allocator = testing.allocator;
+
+    // Insertion benchmark
+    try benchmarkInsertion(allocator, 100000, 128);
+
+    // Search benchmark
+    try benchmarkSearch(allocator, 100000, 128, 10000, 10);
+}
+
+pub fn benchmarkInsertion(allocator: std.mem.Allocator, num_points: usize, dim: usize) !void {
+    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    defer hnsw.deinit();
+
+    var timer = try std.time.Timer.start();
+    const start = timer.lap();
+
+    for (0..num_points) |_| {
+        const point = try randomPoint(allocator, dim);
+        defer allocator.free(point);
+        try hnsw.insert(point);
+    }
+
+    const end = timer.lap();
+    const elapsed_ns = end - start;
+    const points_per_second = @as(f64, @floatFromInt(num_points)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    std.debug.print("Insertion Benchmark:\n", .{});
+    std.debug.print("  Points: {d}\n", .{num_points});
+    std.debug.print("  Dimensions: {d}\n", .{dim});
+    std.debug.print("  Total time: {d:.2} seconds\n", .{@as(f64, @floatFromInt(elapsed_ns)) / 1e9});
+    std.debug.print("  Points per second: {d:.2}\n", .{points_per_second});
+}
+
+pub fn benchmarkSearch(allocator: std.mem.Allocator, num_points: usize, dim: usize, num_queries: usize, k: usize) !void {
+    var hnsw = HNSW(f32).init(allocator, 16, 200);
+    defer hnsw.deinit();
+
+    // Insert points
+    for (0..num_points) |_| {
+        const point = try randomPoint(allocator, dim);
+        defer allocator.free(point);
+        try hnsw.insert(point);
+    }
+
+    var timer = try std.time.Timer.start();
+    const start = timer.lap();
+
+    for (0..num_queries) |_| {
+        const query = try randomPoint(allocator, dim);
+        defer allocator.free(query);
+        const results = try hnsw.search(query, k);
+        allocator.free(results);
+    }
+
+    const end = timer.lap();
+    const elapsed_ns = end - start;
+    const queries_per_second = @as(f64, @floatFromInt(num_queries)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    std.debug.print("Search Benchmark:\n", .{});
+    std.debug.print("  Points in index: {d}\n", .{num_points});
+    std.debug.print("  Dimensions: {d}\n", .{dim});
+    std.debug.print("  Queries: {d}\n", .{num_queries});
+    std.debug.print("  k: {d}\n", .{k});
+    std.debug.print("  Total time: {d:.2} seconds\n", .{@as(f64, @floatFromInt(elapsed_ns)) / 1e9});
+    std.debug.print("  Queries per second: {d:.2}\n", .{queries_per_second});
 }
