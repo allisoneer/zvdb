@@ -1,0 +1,25 @@
+{
+  "version": "2.0",
+  "mount_dirs": {
+    "thoughts": "thoughts",
+    "context": "context",
+    "references": "references"
+  },
+  "thoughts_mount": {
+    "remote": "git@github.com:allisoneer/personal_thoughts.git",
+    "subpath": "projects/zvdb/thoughts",
+    "sync": "auto"
+  },
+  "context_mounts": [
+    {
+      "remote": "git@github.com:allisoneer/personal_thoughts.git",
+      "subpath": "projects/zvdb/context",
+      "mount_path": "general",
+      "sync": "auto"
+    }
+  ],
+  "references": [
+    "https://codeberg.org/ziglang/zig.git"
+  ]
+}
+

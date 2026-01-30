@@ -1,0 +1,19 @@
+{
+	"version": "1.0",
+	"mount_dirs": {
+		"repository": "context",
+		"personal": "personal"
+	},
+	"requires": [
+		{
+			"remote": "git@github.com:allisoneer/personal_thoughts.git",
+			"mount_path": "general",
+			"subpath": "projects/zvdb",
+			"description": "Repository mount for agentic_auxilary",
+			"optional": false,
+			"sync": "auto"
+		}
+	],
+	"rules": []
+}
+

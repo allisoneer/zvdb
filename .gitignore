@@ -1,3 +1,13 @@
 .zig-cache/
 zig-out/
 .aider*
+.claude/*
+
+# Thoughts data directory (created by thoughts init)
+/.thoughts-data
+
+# Claude settings backup (managed by thoughts)
+/.claude/settings.local.json.bak
+
+# Claude settings quarantine backups (auto-pruned)
+/.claude/settings.local.json.malformed.*.bak
