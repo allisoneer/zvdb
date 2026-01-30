@@ -21,6 +21,66 @@
   "references": [
     "https://codeberg.org/ziglang/zig.git",
     "https://github.com/unum-cloud/USearch.git",
-    "https://github.com/ashvardanian/simsimd.git"
+    "https://github.com/ashvardanian/simsimd.git",
+    {
+      "remote": "https://github.com/jean-pierreBoth/hnswlib-rs",
+      "description": "Best-performing Rust HNSW implementation (62K req/s fashion-mnist, 15K req/s sift1m). Uses simdeez for SIMD, parking_lot for concurrency. Reference for SIMD distance functions and parallel construction."
+    },
+    {
+      "remote": "https://github.com/instant-labs/instant-distance",
+      "description": "Clean, minimal pure-Rust HNSW implementation. Production-tested at Instant Domain Search. Good reference for trait-based distance metrics and clean API design."
+    },
+    {
+      "remote": "https://github.com/rust-cv/hnsw",
+      "description": "Paper-first HNSW implementation built directly from Malkov-Yashunin paper (not ported from C++). Serde support, no_std capable. Good reference for canonical algorithm implementation."
+    },
+    {
+      "remote": "https://github.com/hora-search/hora",
+      "description": "Multi-algorithm ANN library with HNSW, SSG, PQIVF. Uses packed_simd, supports WebAssembly. Reference for multiple index types and SIMD acceleration patterns."
+    },
+    {
+      "remote": "https://github.com/sarah-quinones/pulp",
+      "description": "Portable SIMD with runtime CPU feature detection and automatic dispatch. Powers faer linear algebra library. Supports AVX2, AVX-512, NEON with FMA. Key library for stable Rust SIMD."
+    },
+    {
+      "remote": "https://github.com/rust-lang/portable-simd",
+      "description": "Official Rust portable SIMD implementation (std::simd). Nightly only but will eventually stabilize. Reference for portable SIMD API design and vector operations."
+    },
+    {
+      "remote": "https://github.com/sarah-quinones/faer-rs",
+      "description": "High-performance linear algebra library using pulp for SIMD. Reference for optimized matrix operations and SIMD kernel patterns. AVX-512 support on nightly."
+    },
+    {
+      "remote": "https://github.com/rkyv/rkyv",
+      "description": "Zero-copy deserialization framework. 1.2ns access time. Ideal for HNSW index persistence with instant load times. Works with #[derive] macros."
+    },
+    {
+      "remote": "https://github.com/google/zerocopy",
+      "description": "Google's zero-cost memory manipulation library. Rigorously tested with Miri. Essential for safe byte-to-type casting in tape-based storage patterns."
+    },
+    {
+      "remote": "https://github.com/fitzgen/bumpalo",
+      "description": "Fast bump allocation arena. Ideal for phase-oriented allocations in HNSW construction (batch node insertions). Fast allocation with bulk deallocation."
+    },
+    {
+      "remote": "https://github.com/petgraph/fixedbitset",
+      "description": "Simple fixed-size bitset with SIMD acceleration (AVX). Perfect for visited node tracking in HNSW search. O(1) bit operations."
+    },
+    {
+      "remote": "https://github.com/rayon-rs/rayon",
+      "description": "Data parallelism library with work-stealing. Essential for parallel HNSW construction/search. Convert iter() to par_iter() for automatic parallelization."
+    },
+    {
+      "remote": "https://github.com/crossbeam-rs/crossbeam",
+      "description": "Lock-free concurrent data structures with epoch-based GC. 20x faster than Mutex-based implementations. Lock-free queues and channels for high-performance concurrent access."
+    },
+    {
+      "remote": "https://github.com/Amanieu/parking_lot",
+      "description": "Faster, smaller synchronization primitives. 1.5-5x faster than std::sync::Mutex. Superior RwLock for HNSW read-heavy workloads. Used by hnswlib-rs."
+    },
+    {
+      "remote": "https://github.com/bluss/matrixmultiply",
+      "description": "General matrix multiplication (GEMM) for f32/f64. Reference for optimized SIMD kernels with AVX2, FMA, and multithreading. Used by ndarray."
+    }
   ]
 }
