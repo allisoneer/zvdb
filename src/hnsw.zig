@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
 const Mutex = std.Thread.Mutex;
+const RwLock = std.Thread.RwLock;
 
 pub const distance = @import("distance.zig");
 pub const metadata = @import("metadata.zig");
@@ -65,7 +66,7 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         default_ef_search: usize,
         dims: usize,
         string_table: metadata.StringTable,
-        mutex: Mutex,
+        rwlock: RwLock,
 
         pub fn init(allocator: Allocator, dims: usize, m: usize, ef_construction: usize) Self {
             return .{
@@ -78,7 +79,7 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
                 .default_ef_search = @max(ef_construction, 64),
                 .dims = dims,
                 .string_table = .{},
-                .mutex = .{},
+                .rwlock = .{},
             };
         }
 
@@ -96,8 +97,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         pub fn insert(self: *Self, point: []const T, meta: Metadata) !usize {
             std.debug.assert(point.len == self.dims);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
 
             const id = self.nodes.count();
             const level = self.randomLevel();
@@ -146,20 +147,32 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         }
 
         /// Batch insert multiple points with their metadata.
-        /// Uses single lock and pre-allocated StringTable for efficiency.
+        /// Uses parallel worker threads for graph construction when beneficial.
+        /// Auto-detects optimal thread count based on CPU cores.
         /// Returns slice of inserted IDs (caller owns).
         pub fn insertBatch(self: *Self, points: []const []const T, metas: []const Metadata) ![]usize {
+            return self.insertBatchThreaded(points, metas, null);
+        }
+
+        /// Batch insert with explicit thread count control.
+        /// Pass null for num_threads to auto-detect, or specify exact count.
+        /// Returns slice of inserted IDs (caller owns).
+        pub fn insertBatchThreaded(self: *Self, points: []const []const T, metas: []const Metadata, num_threads: ?usize) ![]usize {
             std.debug.assert(points.len == metas.len);
-            if (points.len == 0) return &[_]usize{};
+            const n = points.len;
+            if (n == 0) return &[_]usize{};
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            // Validate all dimensions
+            // Validate dims (no lock needed)
             for (points) |p| std.debug.assert(p.len == self.dims);
 
+            // === STAGE 1: Sequential setup under exclusive lock ===
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+
             const base_id = self.nodes.count();
-            const n = points.len;
+
+            // Pre-reserve HashMap capacity
+            try self.nodes.ensureTotalCapacity(@intCast(base_id + n));
 
             // Pre-compute random levels
             const levels = try self.allocator.alloc(usize, n);
@@ -170,7 +183,7 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
                 if (lvl.* > max_level_new) max_level_new = lvl.*;
             }
 
-            // Pre-grow StringTable once for all metadata
+            // Pre-grow StringTable
             const add_bytes = metadata.totalStringBytesForBatch(Metadata, metas);
             const old_len = self.string_table.data.len;
             try self.string_table.ensureAdditionalCapacity(self.allocator, add_bytes);
@@ -184,54 +197,159 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
             }
 
             // Allocate result IDs
-            var ids = try self.allocator.alloc(usize, n);
+            const ids = try self.allocator.alloc(usize, n);
             errdefer self.allocator.free(ids);
+            for (ids, 0..) |*idp, i| idp.* = base_id + i;
 
-            // Insert nodes sequentially, connecting to graph
-            for (points, 0..) |p, idx| {
-                const id = base_id + idx;
-                const level = levels[idx];
-                var node = try Node.init(self.allocator, id, p, level, fixeds[idx]);
+            // Pre-insert all nodes with empty connections
+            for (points, 0..) |p, i| {
+                const id = base_id + i;
+                const level = levels[i];
+                var node = try Node.init(self.allocator, id, p, level, fixeds[i]);
                 errdefer node.deinit(self.allocator);
+
+                // Pre-reserve connection capacity to avoid realloc during parallel phase
+                for (node.connections) |*alist| {
+                    try alist.ensureTotalCapacity(self.allocator, self.m + 1);
+                }
                 try self.nodes.put(id, node);
-                ids[idx] = id;
+            }
 
-                // Connect using same algorithm as single insert
-                if (self.entry_point) |entry| {
-                    var ep_copy = entry;
-                    var curr_dist = dist(node.point, self.nodes.get(ep_copy).?.point);
-
-                    for (0..self.max_level + 1) |layer| {
-                        var changed = true;
-                        while (changed) {
-                            changed = false;
-                            const curr_node = self.nodes.get(ep_copy).?;
-                            if (layer < curr_node.connections.len) {
-                                for (curr_node.connections[layer].items) |neighbor_id| {
-                                    const neighbor = self.nodes.get(neighbor_id).?;
-                                    const d = dist(node.point, neighbor.point);
-                                    if (d < curr_dist) {
-                                        ep_copy = neighbor_id;
-                                        curr_dist = d;
-                                        changed = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (layer <= level) {
-                            try self.connect(id, ep_copy, @intCast(layer));
-                        }
+            // Pre-reserve capacity on existing nodes too
+            var it = self.nodes.iterator();
+            while (it.next()) |kv| {
+                for (kv.value_ptr.connections) |*alist| {
+                    if (alist.capacity < self.m + 1) {
+                        try alist.ensureTotalCapacity(self.allocator, self.m + 1);
                     }
-
-                    // Update max_level as we go to help subsequent inserts
-                    if (level > self.max_level) self.max_level = level;
-                } else {
-                    self.entry_point = id;
                 }
             }
 
-            if (max_level_new > self.max_level) self.max_level = max_level_new;
+            // === STAGE 2: Connection building ===
+            const requested_threads = num_threads orelse (std.Thread.getCpuCount() catch 1);
+            const worker_count = @min(requested_threads, n);
+
+            if (worker_count <= 1 or self.entry_point == null) {
+                // Sequential fallback for small batches or first insert
+                for (0..n) |i| {
+                    const id = base_id + i;
+                    const level = levels[i];
+                    if (self.entry_point) |entry| {
+                        var ep_copy = entry;
+                        var curr_dist = dist(self.nodes.get(id).?.point, self.nodes.get(ep_copy).?.point);
+
+                        for (0..self.max_level + 1) |layer| {
+                            var changed = true;
+                            while (changed) {
+                                changed = false;
+                                const curr_node = self.nodes.get(ep_copy).?;
+                                if (layer < curr_node.connections.len) {
+                                    for (curr_node.connections[layer].items) |neighbor_id| {
+                                        const neighbor = self.nodes.get(neighbor_id).?;
+                                        const d = dist(self.nodes.get(id).?.point, neighbor.point);
+                                        if (d < curr_dist) {
+                                            ep_copy = neighbor_id;
+                                            curr_dist = d;
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if (layer <= level) {
+                                self.connect(id, ep_copy, @intCast(layer)) catch {};
+                            }
+                        }
+                        if (level > self.max_level) self.max_level = level;
+                    } else {
+                        self.entry_point = id;
+                    }
+                }
+            } else {
+                // Parallel execution
+                const ThreadCtx = struct {
+                    hnsw: *Self,
+                    ids: []const usize,
+                    levels: []const usize,
+                    start: usize,
+                    end: usize,
+                };
+
+                const worker_fn = struct {
+                    fn run(ctx: *const ThreadCtx) void {
+                        for (ctx.start..ctx.end) |i| {
+                            const id = ctx.ids[i];
+                            const level = ctx.levels[i];
+
+                            if (ctx.hnsw.entry_point) |entry| {
+                                var ep_copy = entry;
+                                var curr_dist = dist(ctx.hnsw.nodes.get(id).?.point, ctx.hnsw.nodes.get(ep_copy).?.point);
+
+                                var layer: usize = ctx.hnsw.max_level;
+                                while (true) {
+                                    const curr_node = ctx.hnsw.nodes.get(ep_copy) orelse break;
+                                    if (layer < curr_node.connections.len) {
+                                        for (curr_node.connections[layer].items) |neighbor_id| {
+                                            const neighbor = ctx.hnsw.nodes.get(neighbor_id) orelse continue;
+                                            const d = dist(ctx.hnsw.nodes.get(id).?.point, neighbor.point);
+                                            if (d < curr_dist) {
+                                                ep_copy = neighbor_id;
+                                                curr_dist = d;
+                                            }
+                                        }
+                                    }
+
+                                    if (layer <= level) {
+                                        ctx.hnsw.connect(id, ep_copy, @intCast(layer)) catch {};
+                                    }
+
+                                    if (layer == 0) break;
+                                    layer -= 1;
+                                }
+                            }
+                        }
+                    }
+                }.run;
+
+                var threads = try self.allocator.alloc(std.Thread, worker_count);
+                defer self.allocator.free(threads);
+                var contexts = try self.allocator.alloc(ThreadCtx, worker_count);
+                defer self.allocator.free(contexts);
+
+                const chunk = (n + worker_count - 1) / worker_count;
+                var spawned: usize = 0;
+                for (0..worker_count) |wi| {
+                    const start = wi * chunk;
+                    const end = @min(start + chunk, n);
+                    if (start >= end) continue;
+
+                    contexts[spawned] = .{
+                        .hnsw = self,
+                        .ids = ids,
+                        .levels = levels,
+                        .start = start,
+                        .end = end,
+                    };
+                    threads[spawned] = try std.Thread.spawn(.{}, worker_fn, .{&contexts[spawned]});
+                    spawned += 1;
+                }
+
+                for (threads[0..spawned]) |*t| t.join();
+            }
+
+            // Update entry_point and max_level after parallel phase
+            if (self.entry_point == null) {
+                self.entry_point = ids[0];
+            }
+            if (max_level_new > self.max_level) {
+                self.max_level = max_level_new;
+                for (ids, 0..) |nid, i| {
+                    if (levels[i] == max_level_new) {
+                        self.entry_point = nid;
+                        break;
+                    }
+                }
+            }
+
             return ids;
         }
 
@@ -239,8 +357,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         /// Search will still traverse through deleted nodes' neighbors but exclude them from results.
         /// If the entry point is deleted, it will be updated to a non-deleted neighbor if possible.
         pub fn delete(self: *Self, id: usize) Error!void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
             const node = self.nodes.getPtr(id) orelse return Error.NodeNotFound;
             if (node.deleted) return Error.NodeDeleted;
             node.deleted = true;
@@ -285,8 +403,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         /// Returns error if node is deleted or not found.
         pub fn updateInPlace(self: *Self, id: usize, point: []const T, meta: Metadata) !void {
             std.debug.assert(point.len == self.dims);
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
 
             const node = self.nodes.getPtr(id) orelse return Error.NodeNotFound;
             if (node.deleted) return Error.NodeDeleted;
@@ -300,8 +418,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         /// Compact the index by removing deleted nodes and rebuilding contiguous IDs.
         /// Remaps all connections to new IDs. Updates entry point.
         pub fn compact(self: *Self) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
 
             try self.compactLocked();
         }
@@ -378,7 +496,9 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         }
 
         /// Returns the count of non-deleted nodes.
-        pub fn liveCount(self: *const Self) usize {
+        pub fn liveCount(self: *Self) usize {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
             var live: usize = 0;
             var it = self.nodes.iterator();
             while (it.next()) |kv| {
@@ -388,26 +508,35 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
         }
 
         fn connect(self: *Self, source: usize, target: usize, level: usize) !void {
-            var source_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
-            var target_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
+            // Handle self-edge: no-op
+            if (source == target) return;
 
-            source_node.mutex.lock();
-            defer source_node.mutex.unlock();
-            target_node.mutex.lock();
-            defer target_node.mutex.unlock();
+            // ID-ordered locking to prevent deadlock
+            const first_id = @min(source, target);
+            const second_id = @max(source, target);
 
-            if (level < source_node.connections.len) {
-                try source_node.connections[level].append(self.allocator, target);
+            var first_node = self.nodes.getPtr(first_id) orelse return error.NodeNotFound;
+            var second_node = self.nodes.getPtr(second_id) orelse return error.NodeNotFound;
+
+            first_node.mutex.lock();
+            defer first_node.mutex.unlock();
+            second_node.mutex.lock();
+            defer second_node.mutex.unlock();
+
+            // Add bidirectional connections
+            if (level < first_node.connections.len) {
+                try first_node.connections[level].append(self.allocator, second_id);
             }
-            if (level < target_node.connections.len) {
-                try target_node.connections[level].append(self.allocator, source);
+            if (level < second_node.connections.len) {
+                try second_node.connections[level].append(self.allocator, first_id);
             }
 
-            if (level < source_node.connections.len) {
-                try self.shrinkConnections(source, level);
+            // Shrink if needed
+            if (level < first_node.connections.len) {
+                try self.shrinkConnections(first_id, level);
             }
-            if (level < target_node.connections.len) {
-                try self.shrinkConnections(target, level);
+            if (level < second_node.connections.len) {
+                try self.shrinkConnections(second_id, level);
             }
         }
 
@@ -447,8 +576,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
 
         pub fn searchTopK(self: *Self, query: []const T, k: usize, ef_search_param: usize) ![]search.SearchResult(T) {
             std.debug.assert(query.len == self.dims);
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
 
             return try search.topK(
                 T,
@@ -478,8 +607,8 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
             comptime pred: fn (@TypeOf(ctx), MetaFixed) bool,
         ) ![]search.SearchResult(T) {
             std.debug.assert(query.len == self.dims);
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
 
             return try search.topKFiltered(
                 T,
@@ -502,24 +631,30 @@ pub fn HNSW(comptime T: type, comptime metric: DistanceMetric, comptime Metadata
             return &self.string_table;
         }
 
-        pub fn getNode(self: *const Self, id: usize) ?*const Node {
+        pub fn getNode(self: *Self, id: usize) ?*const Node {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
             return self.nodes.getPtr(id);
         }
 
-        pub fn getMetadata(self: *const Self, id: usize) ?Metadata {
+        pub fn getMetadata(self: *Self, id: usize) ?Metadata {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
             const node = self.nodes.getPtr(id) orelse return null;
             return metadata.decode(Metadata, node.meta_fixed, &self.string_table);
         }
 
-        pub fn count(self: *const Self) usize {
+        pub fn count(self: *Self) usize {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
             return self.nodes.count();
         }
 
         /// Save the entire index to a file.
         /// Always compacts first to ensure clean contiguous IDs.
         pub fn save(self: *Self, path: []const u8) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
 
             // Always compact before save to produce clean file
             try self.compactLocked();

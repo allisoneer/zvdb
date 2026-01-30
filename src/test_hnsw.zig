@@ -1240,6 +1240,154 @@ test "HNSW - Concurrent Access" {
     try testing.expectEqual(@as(usize, 10), results.len);
 }
 
+test "HNSW - Concurrent Search" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 64, 16, 200);
+    defer hnsw.deinit();
+
+    const dim = 64;
+    const num_points = 500;
+
+    // Insert points first
+    for (0..num_points) |_| {
+        const point = try allocator.alloc(f32, dim);
+        defer allocator.free(point);
+        for (point) |*v| {
+            v.* = std.crypto.random.float(f32);
+        }
+        _ = try hnsw.insert(point, {});
+    }
+
+    // Now run concurrent searches
+    const num_threads = 4;
+    const queries_per_thread = 100;
+
+    const ThreadContext = struct {
+        hnsw: *HNSW(f32, .squared_euclidean, void),
+        allocator: std.mem.Allocator,
+    };
+
+    const thread_fn = struct {
+        fn func(ctx: *const ThreadContext) void {
+            for (0..queries_per_thread) |_| {
+                const query = ctx.allocator.alloc(f32, 64) catch continue;
+                defer ctx.allocator.free(query);
+                for (query) |*v| {
+                    v.* = std.crypto.random.float(f32);
+                }
+                const results = ctx.hnsw.searchDefault(query, 10) catch continue;
+                ctx.allocator.free(results);
+            }
+        }
+    }.func;
+
+    var threads: [num_threads]std.Thread = undefined;
+    var contexts: [num_threads]ThreadContext = undefined;
+
+    for (&threads, 0..) |*thread, i| {
+        contexts[i] = .{
+            .hnsw = &hnsw,
+            .allocator = allocator,
+        };
+        thread.* = try std.Thread.spawn(.{}, thread_fn, .{&contexts[i]});
+    }
+
+    for (&threads) |*thread| {
+        thread.join();
+    }
+
+    // If we got here without deadlock, the test passed
+    try testing.expect(true);
+}
+
+test "HNSW - Parallel insertBatch" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 32, 16, 200);
+    defer hnsw.deinit();
+
+    const dim = 32;
+    const batch_size = 200;
+
+    // Prepare batch of points
+    const points = try allocator.alloc([]f32, batch_size);
+    defer allocator.free(points);
+    for (points) |*p| {
+        p.* = try allocator.alloc(f32, dim);
+        for (p.*) |*v| {
+            v.* = std.crypto.random.float(f32);
+        }
+    }
+    defer for (points) |p| allocator.free(p);
+
+    // Prepare void metadata
+    const metas = try allocator.alloc(void, batch_size);
+    defer allocator.free(metas);
+    for (metas) |*m| m.* = {};
+
+    // Convert to const slices
+    const const_points: []const []const f32 = @ptrCast(points);
+
+    // Insert batch (will use parallel workers internally)
+    const ids = try hnsw.insertBatch(const_points, metas);
+    defer allocator.free(ids);
+
+    // Verify count
+    try testing.expectEqual(batch_size, hnsw.count());
+    try testing.expectEqual(batch_size, ids.len);
+
+    // Verify IDs are sequential
+    for (ids, 0..) |id, i| {
+        try testing.expectEqual(i, id);
+    }
+
+    // Verify search works
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+    for (query) |*v| {
+        v.* = std.crypto.random.float(f32);
+    }
+
+    const results = try hnsw.searchDefault(query, 10);
+    defer allocator.free(results);
+    try testing.expectEqual(@as(usize, 10), results.len);
+}
+
+test "HNSW - insertBatch empty" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 32, 16, 200);
+    defer hnsw.deinit();
+
+    const empty_points: []const []const f32 = &.{};
+    const empty_metas: []const void = &.{};
+
+    const ids = try hnsw.insertBatch(empty_points, empty_metas);
+    try testing.expectEqual(@as(usize, 0), ids.len);
+    try testing.expectEqual(@as(usize, 0), hnsw.count());
+}
+
+test "HNSW - insertBatch single element" {
+    const allocator = testing.allocator;
+    var hnsw = HNSW(f32, .squared_euclidean, void).init(allocator, 4, 16, 200);
+    defer hnsw.deinit();
+
+    const dim = 4;
+    const point = try allocator.alloc(f32, dim);
+    defer allocator.free(point);
+    for (point) |*v| {
+        v.* = std.crypto.random.float(f32);
+    }
+
+    const points: []const []const f32 = &.{point};
+    const metas: []const void = &.{{}};
+
+    const ids = try hnsw.insertBatch(points, metas);
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(usize, 0), ids[0]);
+    try testing.expectEqual(@as(usize, 1), hnsw.count());
+}
+
 test "HNSW - Different Data Types" {
     const allocator = testing.allocator;
 
